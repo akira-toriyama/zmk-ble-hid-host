@@ -8,6 +8,9 @@
 services:
   build:
     image: ghcr.io/zephyrproject-rtos/zephyr-build:latest
+    # Run as root so `west init` can write the root-owned `hogp-ws` named volume.
+    # (On macOS Docker Desktop, bind-mounted outputs still appear owned by you.)
+    user: "root"
     volumes:
       - hogp-ws:/workspace
       - ./:/workspace/probe
@@ -20,6 +23,18 @@ services:
         [ -d .west ] || west init -l probe
         west update --narrow -o=--depth=1
         west zephyr-export
+        # Zephyr 4.1.0 needs SDK 0.17.x, but zephyr-build:latest ships a newer
+        # incompatible SDK (1.0.x). Install 0.17.0 into the cached volume once
+        # (arch-matched) and point Zephyr at it, matching the pinned CI SDK.
+        ARCH=$(uname -m)
+        SDK=zephyr-sdk-0.17.0
+        if [ ! -d "/workspace/$SDK" ]; then
+          wget -nv "https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.17.0/${SDK}_linux-${ARCH}_minimal.tar.xz"
+          tar xJf "${SDK}_linux-${ARCH}_minimal.tar.xz"
+          rm "${SDK}_linux-${ARCH}_minimal.tar.xz"
+          "/workspace/$SDK/setup.sh" -t arm-zephyr-eabi -h -c
+        fi
+        export ZEPHYR_SDK_INSTALL_DIR="/workspace/$SDK"
         west build -b xiao_ble probe -d build
         mkdir -p probe/firmware
         cp build/zephyr/zephyr.uf2 probe/firmware/zephyr.uf2
