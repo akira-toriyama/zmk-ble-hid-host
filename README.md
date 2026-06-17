@@ -118,7 +118,17 @@ decoder is designed to derive the layout at runtime from the device's HID
 Report Map, but you should still capture a ground-truth sample to (a) confirm
 the device is plain HOGP and (b) build decoder test fixtures.
 
-Using **nRF Connect for Mobile** (iOS/Android):
+> **Detailed, verified runbook (macOS): [`docs/device-capture-macos.md`](./docs/device-capture-macos.md)**, with a fill-in record at
+> [`tests/parser/fixtures/ist_pro_capture.template.md`](./tests/parser/fixtures/ist_pro_capture.template.md).
+> Two caveats that bite: (1) a phone / third-party GATT browser usually **cannot
+> subscribe to HID Input Report notifications** because the OS grabs the HID
+> profile — on macOS, passively sniff the OS's own session with **PacketLogger**.
+> (2) A green host-pairing test is **necessary but not sufficient**: the
+> embedded-specific risks (NoInputNoOutput pairing, reconnect through a
+> Resolvable Private Address, reconnect-advertising) can only be confirmed by a
+> headless central — the XIAO running this firmware.
+
+Quick capture path with **nRF Connect for Mobile** (iOS/Android) — subject to caveat (1) above:
 
 1. Put the IST PRO into BLE pairing mode and **Connect** from nRF Connect.
 2. Expand the **Human Interface Device** service (UUID `0x1812`).

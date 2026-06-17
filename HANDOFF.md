@@ -99,11 +99,13 @@ M1 のサブステップ:
 
 実機作業は実施可能（ユーザ確認済み 2026-06-18）。コード(🤖 Claude)と実機(👤 ユーザ)の対応:
 
-- [ ] **P-A 事前採取**（今すぐ可・🤖M1 と並行OK／ブロッカーではない） 👤
-      nRF Connect(モバイル)で IST PRO をペアリング → HID service(0x1812) を開く →
-      **Report Map(0x2A4B) の hex** と、ボール移動/各ボタン/ホイール時の**レポート生バイト**を1動作ずつ採取。
-      → `tests/parser/` に fixture 化（M2 デコーダを実機データで単体テスト可能に）。
-      ついでに pairing 方式(Just Works/passkey)・Protocol Mode(0x2A4E)・接続間隔の受諾もメモ。
+- [ ] **P-A 事前採取（macOS / 今すぐ可）** 👤  手順書 `docs/device-capture-macos.md`、記録票 `tests/parser/fixtures/ist_pro_capture.template.md`
+      macOS で IST PRO をペアリング(カーソル動作=粗GO) → **PacketLogger** で Report Map(0x2A4B)＋レポート生バイト＋
+      **アドレス種別(RPA か)**＋接続間隔を採取（macOS が HID を握るので**受動 sniff が正解**。能動 GATT ブラウザ/スマホは OS に通知購読を奪われ不可）。**再接続テスト**も実施。
+      → fixture 化で M2 デコーダを実機データで単体テスト可能に。
+      **重要(検証WFの指摘): macOS green は「必要だが十分でない」。** NoInputNoOutput 受諾 / 素のセントラルの RPA 再接続 /
+      再接続広告の可否は macOS では確認不可 → **真のゲートは XIAO の M1 ファーム**（＝ヘッドレス Zephyr セントラル）。
+      ∴ P-A=「早期失格＋fixture 採取」、M1 が本ゲート。passkey が macOS で出ても NO-GO ではない（NIO 中央は Just Works に解決）。
 - [ ] **P-B M1 動作確認**（🤖 が焼ける .uf2＋ファームビルド CI を用意した後） 👤
       .uf2 を XIAO に焼く（リセット2回でブートローダのドライブ表示 → .uf2 を D&D）→
       USB シリアルでログ確認 → IST PRO をペアリングモードに → 接続して**生レポートがログに出るか**。
