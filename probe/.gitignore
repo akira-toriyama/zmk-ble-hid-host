@@ -1,0 +1,15 @@
+# west workspace (created by a native build; Docker keeps these in a volume)
+/.west/
+/zephyr/
+/modules/
+/tools/
+/bootloader/
+/nrf/
+
+# build outputs
+build/
+firmware/
+*.uf2
+
+# editor / OS
+.DS_Store

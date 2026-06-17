@@ -4,6 +4,17 @@ build/
 *.o
 *.a
 
+# probe/ west workspace (a native build inits the workspace at the repo root)
+/zephyr/
+/modules/
+/tools/
+/bootloader/
+/nrf/
+# probe/ build outputs
+probe/build/
+probe/firmware/
+*.uf2
+
 # Host test binary
 tests/parser/test_runner
 

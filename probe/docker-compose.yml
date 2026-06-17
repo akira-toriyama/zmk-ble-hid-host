@@ -1,0 +1,29 @@
+# Docker-based local build — no native Zephyr SDK needed, only Docker.
+#   cd probe && ./scripts/build.sh        (wraps `docker compose run --rm build`)
+# Output: probe/firmware/zephyr.uf2
+#
+# The Zephyr checkout + SDK live in the named volume `hogp-ws` (cached across
+# runs); this probe dir is bind-mounted at /workspace/probe (self.path = probe),
+# so the host tree stays clean except the copied-out firmware/.
+services:
+  build:
+    image: ghcr.io/zephyrproject-rtos/zephyr-build:latest
+    volumes:
+      - hogp-ws:/workspace
+      - ./:/workspace/probe
+    command:
+      - bash
+      - -lc
+      - |
+        set -e
+        cd /workspace
+        [ -d .west ] || west init -l probe
+        west update --narrow -o=--depth=1
+        west zephyr-export
+        west build -b xiao_ble probe -d build
+        mkdir -p probe/firmware
+        cp build/zephyr/zephyr.uf2 probe/firmware/zephyr.uf2
+        echo "==> probe/firmware/zephyr.uf2 ready"
+
+volumes:
+  hogp-ws:

@@ -1,0 +1,39 @@
+name: probe-build
+
+on:
+  push:
+    paths:
+      - 'probe/**'
+      - '.github/workflows/probe-build.yml'
+  pull_request:
+    paths:
+      - 'probe/**'
+      - '.github/workflows/probe-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: xiao_ble HOGP probe (.uf2)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zephyr project
+        # Runs `west init -l probe` / `west config` / `west update` itself.
+        uses: zephyrproject-rtos/action-zephyr-setup@v1.0.14
+        with:
+          app-path: probe
+          toolchains: arm-zephyr-eabi      # nRF52840 = Cortex-M4
+          sdk-version: 0.17.0              # 0.17.1+ breaks multithreaded Zephyr <=4.1.0
+
+      - name: West build
+        working-directory: probe
+        run: west build -b xiao_ble .      # source dir = . (cwd is the probe app root)
+
+      - name: Upload UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-uf2
+          path: probe/build/zephyr/zephyr.uf2
+          if-no-files-found: error

@@ -1,0 +1,15 @@
+/*
+ * The Seeed XIAO BLE board (Zephyr v4.1.0) already defines `board_cdc_acm_uart`
+ * (a zephyr,cdc-acm-uart child of the USB device controller) and chooses it for
+ * the console, and the board defconfig sets CONFIG_BUILD_OUTPUT_UF2=y.
+ *
+ * So this overlay only needs to make the console routing explicit. We REUSE the
+ * existing &board_cdc_acm_uart (adding a second cdc_acm node would create a 2nd
+ * /dev/tty.usbmodem*). Never redefine zephyr_udc0 — reference it only.
+ */
+/ {
+	chosen {
+		zephyr,console = &board_cdc_acm_uart;
+		zephyr,shell-uart = &board_cdc_acm_uart;
+	};
+};

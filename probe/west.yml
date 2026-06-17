@@ -1,0 +1,20 @@
+# T2 "application = manifest repo" layout, hosted as the probe/ subdirectory of
+# the zmk-ble-hid-host repo. `west init -l probe` makes this active; `west update`
+# clones upstream Zephyr v4.1.0 + only the modules an nRF52840 BT build needs.
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.1.0            # upstream release TAG
+      import:
+        name-allowlist:
+          - cmsis_6     # CMSIS 6 — required by the ARM Cortex-M port (NOT legacy 'cmsis')
+          - hal_nordic  # nrfx + MDK + radio/clock drivers the SW Link Layer drives
+          - mbedtls     # PSA crypto provider pulled in by the BT host once CONFIG_BT=y
+
+  self:
+    path: probe
