@@ -3,7 +3,7 @@
 > セッションをまたいで作業を継続するための正本。**未達成を暗黙にしない**。
 > 各セッション終了時にここを更新する。会話言語は日本語。
 
-最終更新: 2026-06-18（M0 完了 + 実機作業フェーズ追記。XIAO/IST PRO 実機ありを確認）
+最終更新: 2026-06-18（M0 完了 + 実機作業フェーズ追記 + **P-A 粗GO達成・IST PRO Report Map 採取済み**）
 計画書: `/Users/tommy/.claude/plans/distributed-hatching-hejlsberg.md`
 元ブリーフ: `/Users/tommy/Downloads/zmk-ble-hid-host-brief.md`
 
@@ -99,13 +99,15 @@ M1 のサブステップ:
 
 実機作業は実施可能（ユーザ確認済み 2026-06-18）。コード(🤖 Claude)と実機(👤 ユーザ)の対応:
 
-- [ ] **P-A 事前採取（macOS / 今すぐ可）** 👤  手順書 `docs/device-capture-macos.md`、記録票 `tests/parser/fixtures/ist_pro_capture.template.md`
-      macOS で IST PRO をペアリング(カーソル動作=粗GO) → **PacketLogger** で Report Map(0x2A4B)＋レポート生バイト＋
-      **アドレス種別(RPA か)**＋接続間隔を採取（macOS が HID を握るので**受動 sniff が正解**。能動 GATT ブラウザ/スマホは OS に通知購読を奪われ不可）。**再接続テスト**も実施。
-      → fixture 化で M2 デコーダを実機データで単体テスト可能に。
-      **重要(検証WFの指摘): macOS green は「必要だが十分でない」。** NoInputNoOutput 受諾 / 素のセントラルの RPA 再接続 /
-      再接続広告の可否は macOS では確認不可 → **真のゲートは XIAO の M1 ファーム**（＝ヘッドレス Zephyr セントラル）。
-      ∴ P-A=「早期失格＋fixture 採取」、M1 が本ゲート。passkey が macOS で出ても NO-GO ではない（NIO 中央は Just Works に解決）。
+- [x] **P-A-1 macOS ペアリング成功＝粗GO** ✅（2026-06-18）。専用ドングルなしで汎用ホストにペア＆ボンド＝ベンダロックでない。
+- [x] **P-A-2 Report Map 採取済み**（`ioreg`、PacketLogger 不要）→ fixture
+      `tests/parser/fixtures/ist_pro.report_map.hex` ＋ 解説 `…/ist_pro_report_descriptor.md`。
+      ELECOM IST PRO, VID `0x056E`/PID `0x018A`。**標準 HOGP 確定**。
+      ポインタ = **Report ID 2**：byte1=buttons(1-8), 2-3=X(int16 LE), 4-5=Y(int16 LE), 6=wheel(int8), 7=AC Pan(int8)、計8B。
+      自動デコードで検証済み＝汎用パーサで自明に解ける（**設計 GO**）。手順書 `docs/device-capture-macos.md`。
+- [ ] **P-A 残（PacketLogger 不要に。M1 で吸収）**: 実 BLE 通知の生バイト（report-ID の有無/実バイト順）は **M1 の `LOG_HEXDUMP`** で取得。
+      **アドレス種別(RPA か)/再接続広告/NoInputNoOutput 受諾は macOS では確認不可 → 真のゲートは XIAO の M1 ファーム。**
+      （passkey が macOS で出ても NO-GO ではない＝NIO 中央は Just Works に解決。）
 - [ ] **P-B M1 動作確認**（🤖 が焼ける .uf2＋ファームビルド CI を用意した後） 👤
       .uf2 を XIAO に焼く（リセット2回でブートローダのドライブ表示 → .uf2 を D&D）→
       USB シリアルでログ確認 → IST PRO をペアリングモードに → 接続して**生レポートがログに出るか**。
