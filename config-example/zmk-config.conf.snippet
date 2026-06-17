@@ -1,0 +1,29 @@
+# Kconfig to add to your zmk-config (e.g. config/<your_board>.conf).
+#
+# Flag names verified against Zephyr v4.1 (ZMK's pinned tree). These become
+# REQUIRED once the BLE HOGP central code lands (milestone M1); they are NOT
+# needed by the M0 skeleton. The exact minimal set will be re-validated when
+# the firmware build CI is added in M1 (see HANDOFF.md).
+
+# --- Input subsystem (always required) ---
+CONFIG_INPUT=y
+CONFIG_ZMK_POINTING=y
+
+# --- BLE central / GATT client (HOGP ingest, M1+) ---
+CONFIG_BT_CENTRAL=y
+CONFIG_BT_OBSERVER=y
+CONFIG_BT_GATT_CLIENT=y
+CONFIG_BT_GATT_AUTO_DISCOVER_CCC=y
+
+# --- Pairing / bonding with the trackball (M1+) ---
+CONFIG_BT_SMP=y
+CONFIG_BT_BONDABLE=y
+CONFIG_BT_SETTINGS=y
+
+# --- Connection budget: central (trackball) + peripheral (PC) [+ split, if any] ---
+CONFIG_BT_MAX_CONN=4
+CONFIG_BT_MAX_PAIRED=4
+
+# --- Optional: bring-up logging (M1 debugging) ---
+# CONFIG_ZMK_USB_LOGGING=y
+# CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL_DBG=y

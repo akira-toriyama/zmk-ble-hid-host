@@ -1,0 +1,16 @@
+# Snippet -- MERGE into your own zmk-config's `config/west.yml`.
+# Do not replace your manifest wholesale; just add the remote + project.
+#
+# This registers the module so `west update` fetches it when building firmware.
+
+manifest:
+  remotes:
+    # ... your existing remotes (e.g. zmkfirmware) ...
+    - name: akira-toriyama
+      url-base: https://github.com/akira-toriyama
+  projects:
+    # ... your existing projects (incl. the zmk project) ...
+    - name: zmk-ble-hid-host
+      remote: akira-toriyama
+      revision: main
+  # self: ...  (leave your existing `self:` block unchanged)

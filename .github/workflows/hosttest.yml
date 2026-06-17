@@ -1,0 +1,15 @@
+name: host-tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parser:
+    name: parser/decoder host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run host-side parser/decoder tests
+        run: make -C tests/parser test

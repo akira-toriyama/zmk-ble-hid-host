@@ -1,0 +1,30 @@
+/*
+ * Example board overlay for a Seeed XIAO nRF52840 dongle running
+ * zmk-ble-hid-host. Copy the relevant nodes into your zmk-config's
+ * board/shield overlay (e.g. config/<your_board>.overlay).
+ *
+ * Node convention verified against ZMK pointing docs:
+ *   - the input device is a plain root node with compatible "zmk,ble-hid-host"
+ *   - a zmk,input-listener node (with a label) subscribes to it
+ *   - input-processors are attached in the *keymap* via the listener's label
+ *     (see ist_pro.keymap.snippet)
+ */
+
+/ {
+    /* The BLE HID host virtual input device. */
+    trackball: ble_hid_host {
+        compatible = "zmk,ble-hid-host";
+
+        /* Optional: only connect to a peer advertising this EXACT name.
+         * Capture the real advertised name with nRF Connect (README section 8).
+         * Leave commented to connect to the first discovered HOGP pointer. */
+        // device-name = "ELECOM TrackBall";
+    };
+
+    /* Feed the device's input into ZMK. Processors are attached in the keymap
+     * through the &trackball_listener label. */
+    trackball_listener: trackball_listener {
+        compatible = "zmk,input-listener";
+        device = <&trackball>;
+    };
+};

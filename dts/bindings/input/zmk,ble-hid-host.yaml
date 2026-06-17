@@ -1,0 +1,20 @@
+# Copyright (c) 2026 akira-toriyama
+# SPDX-License-Identifier: MIT
+
+description: |
+  Virtual input device that connects to a Bluetooth HID (HOGP) pointing device
+  as a BLE central, decodes its HID reports, and republishes them into ZMK's
+  input subsystem. Bind it with a zmk,input-listener node.
+
+  The byte layout of the peer's reports is derived at runtime from its HID
+  Report Map (characteristic 0x2A4B), so no field offsets are configured here.
+
+compatible: "zmk,ble-hid-host"
+
+properties:
+  device-name:
+    type: string
+    description: |
+      Optional. If set, only connect to a peer whose GAP advertised name
+      matches this string exactly. If unset, connect to the first discovered
+      HOGP pointing device (Appearance / HID service based).

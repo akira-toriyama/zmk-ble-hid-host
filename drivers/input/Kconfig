@@ -1,0 +1,35 @@
+# Copyright (c) 2026 akira-toriyama
+# SPDX-License-Identifier: MIT
+
+if INPUT
+
+menuconfig ZMK_BLE_HID_HOST
+    bool "ZMK BLE HID Host (HOGP central) input device"
+    default y
+    depends on DT_HAS_ZMK_BLE_HID_HOST_ENABLED
+    help
+      Connect to a Bluetooth HID (HOGP / HID-over-GATT) pointing device as a
+      BLE central, decode its HID reports, and republish them into ZMK's input
+      subsystem so they can be remapped by zmk,input-listener / input-processors
+      and output over USB/BLE by ZMK core.
+
+      This module performs ingest only. Remapping and HID output stay in ZMK.
+
+      Enabled automatically when a "zmk,ble-hid-host" devicetree node is present.
+
+if ZMK_BLE_HID_HOST
+
+# Standard Zephyr logging level knob -> CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL.
+module = ZMK_BLE_HID_HOST
+module-str = ZMK BLE HID Host
+source "subsys/logging/Kconfig.template.log_config"
+
+# NOTE (M1): the BLE central / GATT-client requirements are NOT selected here
+# yet. They are documented in README.md and must be enabled in the consuming
+# zmk-config (CONFIG_BT_CENTRAL, CONFIG_BT_OBSERVER, CONFIG_BT_GATT_CLIENT,
+# CONFIG_BT_GATT_AUTO_DISCOVER_CCC, a sufficient CONFIG_BT_MAX_CONN, etc.).
+# Milestone M1 will revisit whether to `select` the additive ones here.
+
+endif # ZMK_BLE_HID_HOST
+
+endif # INPUT

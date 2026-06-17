@@ -1,0 +1,12 @@
+# Zephyr / west build artifacts
+build/
+.west/
+*.o
+*.a
+
+# Host test binary
+tests/parser/test_runner
+
+# Editor / OS
+.DS_Store
+*.swp
