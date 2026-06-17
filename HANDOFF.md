@@ -3,7 +3,8 @@
 > セッションをまたいで作業を継続するための正本。**未達成を暗黙にしない**。
 > 各セッション終了時にここを更新する。会話言語は日本語。
 
-最終更新: 2026-06-18（M0 完了 + 実機作業フェーズ追記 + **P-A 粗GO達成・IST PRO Report Map 採取済み**）
+最終更新: 2026-06-18（**M1 実機進行中**: HOGP プローブ `probe/` を実機で boot/scan/connect 確認、
+ボンドは未達。CI＋Docker ローカルビルドの両方で flashable な .uf2 が出る状態。詳細は §M1）
 計画書: `/Users/tommy/.claude/plans/distributed-hatching-hejlsberg.md`
 元ブリーフ: `/Users/tommy/Downloads/zmk-ble-hid-host-brief.md`
 
@@ -14,8 +15,10 @@
 XIAO nRF52840 を「BLE トラックボール(Elecom IST PRO)を BLE central で受け、デコードして
 ZMK の input subsystem に流す」モジュール。リマップ／出力は ZMK 本体に丸投げ（受信専用）。
 
-- **現在のマイルストーン: M0 完了。次は M1。**
+- **現在のマイルストーン: M0 完了 → M1 実機進行中（§M1 参照）。**
 - ZMK 本体は fork しない。3層構成（zmk 無改変 + 本モジュール + ユーザ zmk-config）。
+  - ユーザの zmk-config = **`akira-toriyama/canon`**（Cyboard Imprint 分割キーボード）。
+    ただし本ドングルは別デバイス → **M4 で「自己完結 or canon に統合」を選択**（今は canon を触らない）。
 - **実機: ユーザ手元に XIAO nRF52840・Elecom IST PRO あり（焼き/USB/ペアリング等の実機作業は実施可能、2026-06-18 確認）。**
 
 ### 構成（確認済み・2026-06-18）
@@ -30,6 +33,37 @@ ZMK の input subsystem に流す」モジュール。リマップ／出力は Z
 - 「BT で IST PRO と XIAO を接続」という理解は**正しい**（その BT は BLE / HOGP）。
 - 出力は USB なので機能上 BLE ペリフェラル(PC広告)は必須でないが、ZMK 本体が標準で広告を持つため
   実際は central+peripheral 共存（nRF52840 は同時対応可。ZMK split が既に両役で動作）。
+
+## §M1. 受信プローブ（実機進行中）— `probe/`
+
+M1「受信だけ」を、**ZMK ではなく単体 Zephyr 診断アプリ**として `probe/` に実装。
+xiao_ble 用に scan→接続→ボンド(Just Works/NIO)→全 HID input report を subscribe→
+**USB CDC ACM に LOG_HEXDUMP**。HOGP コードは後で ZMK モジュールへ移植。
+
+**ビルド（両方とも flashable .uf2 を生成・検証済み）**:
+- ローカル(Docker、ユーザ要件): `cd probe && ./scripts/build.sh` → `probe/firmware/zephyr.uf2`。
+  Zephyr v4.1.0 を import、**SDK 0.17.0 を volume にインストール**（image 同梱の 1.0.x は v4.1 非互換）。
+  はまり所: compose は `$VAR` を食う→ビルド手順は `probe/scripts/docker-build.sh` に分離。volume は root 所有→`user: root`。
+- CI: `.github/workflows/probe-build.yml`（action-zephyr-setup, sdk 0.17.0, `west build -b xiao_ble .`）。
+  成果物 `probe-uf2`。CI と Docker は**バイト同一**（500224B, 977 blocks）。
+- 焼く: XIAO リセット2回→ドライブ→`.uf2` D&D。ログ: `screen /dev/tty.usbmodem<XXXX> 115200`
+  （プローブの tty は location 名 `usbmodem21101` 等。USB serial 名では出ない場合あり）。
+
+**実機結果（2026-06-18）**:
+- ✅ build/flash/boot/USB-log/BT有効/scan/**connect** まで全部実機で動作確認（こちらで `cat /dev/cu...` 採取）。
+- ❌ **ボンド未達**。近傍の BLE HID 2台（`EA:36:99:14:56:4E`, `CD:CF:BF:79:9C:00`、いずれも random）に
+  繋ぐが SMP `peer reason 0x8`（unspecified）で拒否。＝相手がペアリング受付状態でない or 別デバイス
+  （**Cyboard Imprint** も BLE HID でフィルタに合致しうる）。IST PRO がどれか名前で未確認だった。
+- → **probe v2** を投入（main.c）: ①全アドバタイザの**名前/appearance/HIDS をログ**(`saw ...`、dedup)
+  ②ペアリング失敗で**即 disconnect**（旧版は ~100s 居座り無言だった）③失敗アドレスを 8s **クールダウン**して巡回。
+  v2 は CI green + Docker 済み、`probe/firmware/zephyr.uf2` に配置済み。
+
+**次の一手（実機・ユーザ）**:
+1. v2 を焼き直す → IST PRO を**空き BT スロットでペアリングモード**（青点滅）。
+2. シリアルの `saw <addr> name '<name>'` で **IST PRO を名前で特定**（Imprint と区別）。在不在＆ペアリングモードか確認。
+3. ボンド成功 → discovery → **HID report の hexdump**（ボール移動）＝**M1 達成**。
+   失敗が続くなら main.c のフィルタを「名前 IST/ELECOM のみ」等に絞って焼き直す。
+- **採取した HID report 生バイト＋既存の Report Map(`tests/parser/fixtures/ist_pro.report_map.hex`)が M2 デコーダの実機テスト材料。**
 
 ## 2. 完了（M0）＝ 検証済み
 
