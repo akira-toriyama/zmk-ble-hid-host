@@ -25,6 +25,7 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/hci.h>
 
 #include <zephyr/logging/log.h>
 
@@ -56,6 +57,31 @@ static size_t pending_idx;
 /* Each subscription needs its OWN long-lived params (never one shared global). */
 static struct bt_gatt_subscribe_params sub_params[MAX_REPORTS];
 static size_t sub_count;
+
+/* Diagnostics: log each distinct advertiser (and its scan-response name) once,
+ * so the IST PRO can be told apart from other BLE HID devices nearby. */
+#define MAX_SEEN 24
+struct seen_dev {
+	bt_addr_le_t addr;
+	bool named; /* have we already logged a non-empty name for this addr? */
+};
+static struct seen_dev seen[MAX_SEEN];
+static size_t seen_count;
+
+/* Cooldown: after a pairing failure, skip the same device for a while so the
+ * scanner cycles to other advertisers (e.g. the IST PRO in pairing mode)
+ * instead of hammering a device that refuses to bond. */
+#define FAIL_COOLDOWN_MS 8000
+static bt_addr_le_t last_failed_addr;
+static uint32_t last_failed_ms;
+
+/* Parsed advertising/scan-response fields for one report. */
+struct ad_info {
+	bool match;       /* looks like a HOGP pointer we should connect to */
+	bool has_hids;    /* advertised the HID service (0x1812) */
+	uint16_t appearance;
+	char name[32];
+};
 
 static void start_scan(void);
 static void subscribe_pending(struct bt_conn *conn);
@@ -229,78 +255,108 @@ static bool addr_is_bonded(const bt_addr_le_t *addr)
 	return bf.found;
 }
 
-/* AD parser: accept a HOGP pointer by HIDS UUID, mouse appearance, or name. */
-static bool ad_match_cb(struct bt_data *data, void *user_data)
+/* Parse all relevant AD / scan-response fields of one report into `ai`. */
+static bool ad_parse_cb(struct bt_data *data, void *user_data)
 {
-	bool *match = user_data;
+	struct ad_info *ai = user_data;
 
 	switch (data->type) {
 	case BT_DATA_UUID16_SOME:
 	case BT_DATA_UUID16_ALL:
 		for (int i = 0; i + 1 < data->data_len; i += 2) {
 			if (sys_get_le16(&data->data[i]) == BT_UUID_HIDS_VAL) {
-				*match = true;
-				return false;
+				ai->has_hids = true;
+				ai->match = true;
 			}
 		}
 		break;
 	case BT_DATA_GAP_APPEARANCE:
-		if (data->data_len >= 2 && sys_get_le16(data->data) == APPEARANCE_MOUSE) {
-			*match = true;
-			return false;
+		if (data->data_len >= 2) {
+			ai->appearance = sys_get_le16(data->data);
+			if (ai->appearance == APPEARANCE_MOUSE) {
+				ai->match = true;
+			}
 		}
 		break;
 	case BT_DATA_NAME_SHORTENED:
 	case BT_DATA_NAME_COMPLETE: {
-		char name[32];
-		size_t n = MIN(data->data_len, sizeof(name) - 1);
+		size_t n = MIN(data->data_len, sizeof(ai->name) - 1);
 
-		memcpy(name, data->data, n);
-		name[n] = '\0';
-		if (strstr(name, "IST") || strstr(name, "ELECOM") || strstr(name, "ELE")) {
-			*match = true;
-			return false;
+		memcpy(ai->name, data->data, n);
+		ai->name[n] = '\0';
+		if (strstr(ai->name, "IST") || strstr(ai->name, "ELECOM") ||
+		    strstr(ai->name, "ELE")) {
+			ai->match = true;
 		}
 		break;
 	}
 	default:
 		break;
 	}
-	return true; /* keep parsing */
+	return true; /* parse every field */
+}
+
+/* True if this report is worth logging: first sighting of the address, or the
+ * first time we learn its name (names often arrive in the scan response). */
+static bool should_log(const bt_addr_le_t *addr, bool has_name)
+{
+	for (size_t i = 0; i < seen_count; i++) {
+		if (bt_addr_le_cmp(&seen[i].addr, addr) == 0) {
+			if (has_name && !seen[i].named) {
+				seen[i].named = true;
+				return true;
+			}
+			return false;
+		}
+	}
+	if (seen_count < MAX_SEEN) {
+		bt_addr_le_copy(&seen[seen_count].addr, addr);
+		seen[seen_count].named = has_name;
+		seen_count++;
+	}
+	return true;
 }
 
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
 	char s[BT_ADDR_LE_STR_LEN];
+	struct ad_info ai = {0};
 	int err;
+
+	bt_addr_le_to_str(addr, s, sizeof(s));
+	bt_data_parse(ad, ad_parse_cb, &ai);
+
+	/* Log each distinct advertiser once (and again when we first learn its
+	 * name) so the IST PRO can be told apart from other BLE HID devices. */
+	if (should_log(addr, ai.name[0] != '\0')) {
+		LOG_INF("saw %s rssi %d name '%s' appearance 0x%04x hids %d match %d", s,
+			rssi, ai.name, ai.appearance, ai.has_hids, ai.match);
+	}
 
 	if (default_conn) {
 		return;
 	}
-	/* connectable advertising only */
+	/* Only initiate to connectable advertising (skip scan responses). */
 	if (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
 	    type != BT_GAP_ADV_TYPE_EXT_ADV) {
 		return;
 	}
 
-	/* Reconnect path: the host has resolved an RPA to the bonded identity addr. */
-	bool accept = addr_is_bonded(addr);
+	/* Connect to a bonded peer (reconnect) or anything that looks like a pointer. */
+	bool bonded = addr_is_bonded(addr);
 
-	/* First-pairing path (also a fallback if address resolution misses): match
-	 * by advertised content. Kept active on every scan, not just first boot. */
-	if (!accept) {
-		bool m = false;
-
-		bt_data_parse(ad, ad_match_cb, &m);
-		accept = m;
-	}
-	if (!accept) {
+	if (!bonded && !ai.match) {
 		return;
 	}
 
-	bt_addr_le_to_str(addr, s, sizeof(s));
-	LOG_INF("target %s (rssi %d) — connecting", s, rssi);
+	/* Skip a device that just failed pairing so the scanner cycles to others. */
+	if (!bonded && bt_addr_le_cmp(addr, &last_failed_addr) == 0 &&
+	    (k_uptime_get_32() - last_failed_ms) < FAIL_COOLDOWN_MS) {
+		return;
+	}
+
+	LOG_INF("target %s (rssi %d) name '%s' — connecting", s, rssi, ai.name);
 
 	err = bt_le_scan_stop();
 	if (err) {
@@ -365,7 +421,13 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 			     enum bt_security_err err)
 {
 	if (err != BT_SECURITY_ERR_SUCCESS || level < BT_SECURITY_L2) {
-		LOG_WRN("security failed: level %u err %d", level, err);
+		LOG_WRN("pairing/security failed (level %u err %d) — disconnecting", level,
+			err);
+		/* Remember it (device_found skips it briefly) and drop the link so we
+		 * don't sit silently on a peer that refuses to bond. */
+		bt_addr_le_copy(&last_failed_addr, bt_conn_get_dst(conn));
+		last_failed_ms = k_uptime_get_32();
+		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		return;
 	}
 	LOG_INF("secured (level %u) — starting GATT discovery", level);
