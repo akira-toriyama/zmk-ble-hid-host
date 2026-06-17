@@ -3,7 +3,7 @@
 > セッションをまたいで作業を継続するための正本。**未達成を暗黙にしない**。
 > 各セッション終了時にここを更新する。会話言語は日本語。
 
-最終更新: 2026-06-17（M0 セッション）
+最終更新: 2026-06-18（M0 完了 + 実機作業フェーズ追記。XIAO/IST PRO 実機ありを確認）
 計画書: `/Users/tommy/.claude/plans/distributed-hatching-hejlsberg.md`
 元ブリーフ: `/Users/tommy/Downloads/zmk-ble-hid-host-brief.md`
 
@@ -16,6 +16,20 @@ ZMK の input subsystem に流す」モジュール。リマップ／出力は Z
 
 - **現在のマイルストーン: M0 完了。次は M1。**
 - ZMK 本体は fork しない。3層構成（zmk 無改変 + 本モジュール + ユーザ zmk-config）。
+- **実機: ユーザ手元に XIAO nRF52840・Elecom IST PRO あり（焼き/USB/ペアリング等の実機作業は実施可能、2026-06-18 確認）。**
+
+### 構成（確認済み・2026-06-18）
+
+```
+  Elecom IST PRO ──BLE(HOGP)──▶ XIAO nRF52840 ──USB(HID)──▶ PC
+   (BLE マウス)                  ├ 本モジュール = BLE セントラル(ホスト)役
+                                 └ ZMK 本体     = USB HID 出力役
+```
+
+- XIAO は二役: 「マウスに対して **BLE セントラル/ホスト**」かつ「PC に対して **USB HID デバイス**」。
+- 「BT で IST PRO と XIAO を接続」という理解は**正しい**（その BT は BLE / HOGP）。
+- 出力は USB なので機能上 BLE ペリフェラル(PC広告)は必須でないが、ZMK 本体が標準で広告を持つため
+  実際は central+peripheral 共存（nRF52840 は同時対応可。ZMK split が既に両役で動作）。
 
 ## 2. 完了（M0）＝ 検証済み
 
@@ -38,8 +52,8 @@ ZMK の input subsystem に流す」モジュール。リマップ／出力は Z
 
 - [ ] **ファームの実ビルド未実施**。M0 の C はローカル ZMK の `input_mock.c` 慣習に忠実だが、
       `west build` も GH Actions ファームビルドも**まだ通していない**。→ M1 でファームビルド CI を立てて green にする。
-- [ ] **実機検証ゼロ**（物理 IST PRO / XIAO / nRF Connect が当方に無い）。接続・採取・デコード精度・
-      レイテンシ・bonding 永続化はすべて未確認。→ §6 実機 TODO。
+- [ ] **実機検証ゼロ**（当方=Claude は実機を操作できない）。ただし**ユーザ手元に XIAO・IST PRO があり実機作業は実施可能**
+      （2026-06-18 確認）。接続・採取・デコード精度・レイテンシ・bonding はユーザ実機で確認 → §6 実機作業フェーズ。
 - [ ] **BLE 受信(M1)・デコード(M2)・publish(M3)・配線(M4) は未実装**。
 - [ ] `config-example/zmk-config.conf.snippet` の Kconfig 一式は名前を Zephyr 4.1 で確認済みだが、
       **同時有効化でビルドが通るかは未検証**（M1 のファームビルドで確定する）。
@@ -81,14 +95,27 @@ M1 のサブステップ:
 - **M4 配線**: `config-example/` を実機で詰めて README に確定値。input-processors で軸反転/scaling/snipe/scroll。
 - **M5 ドングル**: ケース・常用（物理作業）。
 
-## 6. 実機 TODO（当方実行不可・ユーザ作業）
+## 6. 実機作業フェーズ（👤 ユーザ担当 / XIAO・IST PRO 手元あり）
 
-- [ ] §8 採取: nRF Connect で IST PRO の Report Map(0x2A4B) hex と各動作のレポート生バイトを採取。
-      → `tests/parser/` に fixture 化（M2 のテストが実機なしで回るようになる）。
-- [ ] pairing 方式（Just Works / passkey）と bond 永続化の確認。
-- [ ] 7.5ms 接続間隔を IST PRO が受諾するか（省電力で固定される可能性）。
-- [ ] `seeeduino_xiao_ble` に焼いて M1 ログで実接続・生レポート受信を確認。
-- [ ] M3 以降: PC で実際にカーソルが動く / リマップが効くこと、レイテンシ体感。
+実機作業は実施可能（ユーザ確認済み 2026-06-18）。コード(🤖 Claude)と実機(👤 ユーザ)の対応:
+
+- [ ] **P-A 事前採取**（今すぐ可・🤖M1 と並行OK／ブロッカーではない） 👤
+      nRF Connect(モバイル)で IST PRO をペアリング → HID service(0x1812) を開く →
+      **Report Map(0x2A4B) の hex** と、ボール移動/各ボタン/ホイール時の**レポート生バイト**を1動作ずつ採取。
+      → `tests/parser/` に fixture 化（M2 デコーダを実機データで単体テスト可能に）。
+      ついでに pairing 方式(Just Works/passkey)・Protocol Mode(0x2A4E)・接続間隔の受諾もメモ。
+- [ ] **P-B M1 動作確認**（🤖 が焼ける .uf2＋ファームビルド CI を用意した後） 👤
+      .uf2 を XIAO に焼く（リセット2回でブートローダのドライブ表示 → .uf2 を D&D）→
+      USB シリアルでログ確認 → IST PRO をペアリングモードに → 接続して**生レポートがログに出るか**。
+- [ ] **P-C M3 動作確認** 👤  PC で実際にカーソルが動くか。
+- [ ] **P-D M4 調整** 👤  リマップ(軸反転/swap/scaling/snipe/scroll)が効くか、processor パラメータ実調整。
+- [ ] **P-E M5 常用** 👤  ケース装着・常用。
+
+実機でしか確定しない項目: pairing 方式 / bond 永続化 / 7.5ms 接続間隔の受諾可否 / レイテンシ体感。
+
+> **並行方針**: P-A 採取と 🤖M1 コード実装は**並行可能**。採取は M1 のブロッカーではなく M2 の入力。
+> M1 ファーム自体が生レポートを log するので P-A 無しでも M1 受信確認はできるが、
+> P-A を先にやると HOGP 互換の事前確認＋M2 テスト fixture が得られ手戻りが減る。
 
 ## 7. オープン項目 / 既知の不確定
 
