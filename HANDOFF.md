@@ -19,6 +19,60 @@
 
 ---
 
+## ⚠️ 最新 (2026-06-18 PM) — 再接続バグ修正 ＋ M4 実現可能性 確定
+
+### 🐛 再接続バグ修正（config のみ・ブランチ `fix/reconnect-directed-adv` commit `ffab7d7`）— **実機検証待ち P-C'**
+
+ユーザ報告: **マウス電源 OFF→ON、または ドングルを USB から抜き差しすると 毎回 再ペアリングが必要**。
+受信器 shield `.conf` の **2つの設定欠落**が原因（症状ごとに1つずつ）。実ビルドの `.config` で裏取り済:
+
+1. **抜き差し / XIAO 再起動 → 再ペア**: `CONFIG_BT_SETTINGS=y` は書いてあったが **silently dropped**。
+   `BT_SETTINGS` は `SETTINGS` サブシステムに depends し、`ZMK_BLE=n` では ZMK が `SETTINGS` を引き込まない。
+   旧ファームの `.config` は `# CONFIG_SETTINGS is not set` → **ボンドが flash に未保存＝毎起動で消失**。
+   → `CONFIG_SETTINGS=y` ＋ `FLASH/FLASH_MAP/NVS=y`（M1 probe と同じ全チェーン）を明示追加。今は `CONFIG_BT_SETTINGS=y` が実際に解決。
+   **教訓: Kconfig fragment の `=y` は依存未充足だと黙って捨てられる → 必ず実 `.config` で確認する（P-C の「ボンド永続」観測は
+   probe が以前 flash に書いた残骸 or 無干渉 JustWorks 再ペアの見間違い）。**
+2. **マウス電源 OFF→ON → 再ペア**: BLE マウスは既知ホストへ **directed advertising（ADV_DIRECT_IND, セントラルの
+   identity アドレス宛）**で再接続する。Zephyr は既定で **NRPA で scan** するため directed advert がコントローラで弾かれ、
+   ドングルはマウスの復帰を見られない（→ ユーザ視点では再ペア必須）。→ `CONFIG_BT_SCAN_WITH_IDENTITY=y`（probe で実証・
+   `!BT_PRIVACY` 前提＝満たす）。Zephyr Kconfig help に「directed advertise reports for the local identity を受けたいなら有効化」と明記。
+   `device_found` は既に `ADV_DIRECT_IND` を受理する（追加コード不要）。
+
+**ビルド検証**: default + logging 両 `.uf2` が Docker で green。両 `.config` で `CONFIG_SETTINGS=y` /
+`CONFIG_BT_SETTINGS=y` / `CONFIG_BT_SCAN_WITH_IDENTITY=y` 解決を確認。**コード変更なし（.conf のみ）＝M2/M3 のロジックは無傷**。
+logging `.uf2` = `/Volumes/workspace/.zmk-blehh-build/build-log/zephyr/zmk.uf2`（491520B）。
+**残り = P-C' 実機検証（👤 ユーザ・§6）**: ① 新ファームを焼いて **一度だけ通常ペアリング**（旧ファームは未保存なので新規ボンド扱い）→
+② マウス電源 OFF→ON で自動再接続するか、③ ドングル抜き差しで自動再接続するか。再ペア不要になれば修正完了 → main 取込。
+
+### 🎯 M4 実現可能性 確定（多エージェント workflow・敵対検証 3/3 high-confidence 生存）— **モジュール改変ゼロ**
+
+「マウスボタン → キー `a`」は **stock ZMK だけで config のみ**で可能（§4 が懸念していた「自明でない」は解消）。専用 processor
+**`zmk,input-processor-behaviors`（既定インスタンス `&zip_button_behaviors`）** が入力ボタンイベント → keymap behavior を
+橋渡しする（`&mkp` の鏡像。`app/src/input_processors/input_processor_behaviors.c`、in-tree native_sim テスト
+`app/tests/pointing/.../behaviors_basic` で `&kp A`(usage 0x07/0x04) まで実証済）。一致時 `ZMK_INPUT_PROC_STOP` で
+そのボタンは消費＝マウスクリックを出さなくなる（remap の意図どおり）。**本モジュールは `INPUT_BTN_x` を出すだけで無改変、
+受信器 overlay の `trackball_listener` が attach 先**。旧コミュニティ module `badjeff/zmk-input-behavior-listener` は
+upstream 取込で 2024-12 アーカイブ＝不要。M4 config（別 config リポ用の雛形）:
+```dts
+/ {
+    input_processors {
+        zip_btn4_to_a: zip_btn4_to_a {
+            compatible = "zmk,input-processor-behaviors";
+            #input-processor-cells = <0>;        /* 必須(無いと DT build 失敗) */
+            codes    = <INPUT_BTN_3>;            /* ← 物理ボタン4 の実コードは要確認(下記) */
+            bindings = <&kp A>;                  /* codes.length == bindings.length 必須(BUILD_ASSERT) */
+        };
+    };
+};
+&trackball_listener { input-processors = <&zip_btn4_to_a>; };
+```
+**着手前ゲート**: P-C は左右ボタンのみログ確認済。**物理「ボタン4」が実際にどの `INPUT_BTN_x` を出すか**を logging variant で
+先に確定し `codes` を合わせる（`input_report_key` は `INPUT_BTN_0 + i`）。west.yml の ZMK pin は input-processor-behaviors
+（PR #2714, commit `cb867f9`）を含むこと（local checkout HEAD は含む）。レイヤ限定にしたい場合は listener の子ノードに
+`layers = <N>;` を付ける。
+
+---
+
 ## 1. これは何か / 現在地
 
 XIAO nRF52840 を「BLE トラックボール(Elecom IST PRO)を BLE central で受け、デコードして
@@ -384,6 +438,9 @@ M1 のサブステップ:
       IST PRO **自動再接続**（ボンド永続）→ `report map parsed report_id=2`→**5本 subscribe（各 0x2908 から id=1/2/6/4/9 を正しく取得）**
       →ボール移動で `report h=49 dx/dy` 1432件、左ボタン `0x0001`×107・右 `0x0002`×2。**publish は全件 h=49(id=2)のみ＝id フィルタ実機実証
       （非ポインタ report のゴミ移動ゼロ）**。tommy さん「動作OK」＝**PC カーソルが実際に動いた**。→ ①「カーソルが動く」完了。次は M4。
+- [ ] **P-C' 再接続バグ修正 動作確認** 👤  `fix/reconnect-directed-adv` の logging `.uf2` を焼く → 一度通常ペアリング →
+      (a) マウス電源 OFF→ON、(b) ドングル USB 抜き差し の両方で **再ペア不要で自動再接続**するか。OK なら main 取込。
+      ログで確認: 抜き差し後 `paired (bonded=1)` ではなく `secured (level 2)` が出れば既存ボンド再利用＝成功。
 - [ ] **P-D M4 調整** 👤  リマップ(軸反転/swap/scaling/snipe/scroll)が効くか、processor パラメータ実調整。
 - [ ] **P-E M5 常用** 👤  ケース装着・常用。
 
