@@ -81,25 +81,29 @@ zmk-ble-hid-host/
 
 ## Project status
 
-Experiment-driven milestones (from the project brief):
+Experiment-driven milestones (from the project brief). **A full, machine-independent
+continuation guide — build/flash from any PC, plus the M4 and M6 plans — is in
+[`docs/roadmap.md`](./docs/roadmap.md).**
 
 - [x] **M0 — scaffold + CI base.** Module skeleton, DTS binding, virtual input
   device registration, pure decode contract, host-test harness, host-test CI.
-- [x] **M1 — receive (the hardest gate).** ✅ Proven on real hardware via the
-  `probe/` diagnostic: scan → connect to the IST PRO → bond (legacy Just Works /
-  NoInputNoOutput) → GATT discovery → subscribe → 5000+ raw reports received,
-  7.5 ms connection interval accepted. (The probe ports into the module next.)
-- [~] **M2 — decode.** ✅ Report-Map-driven parser + decoder implemented and
-  host-tested against the real IST PRO Report Map and captured reports. **Left:**
-  port the HOGP central into the module (`hog_central.c`) + a module firmware-build CI.
-- [ ] **M3 — input device.** Decoded values → `input_report_rel/key` with
-  button edge tracking (this is when the cursor actually moves).
-- [ ] **M4 — wiring.** `input-listener` + `input-processors` in your zmk-config.
+- [x] **M1 — receive (the hardest gate).** ✅ On device: scan → connect → bond
+  (legacy Just Works / NoInputNoOutput) → discovery → subscribe → 5000+ reports,
+  7.5 ms connection interval accepted.
+- [x] **M2 — decode.** ✅ Report-Map-driven parser + decoder, host-tested and
+  validated on device. Plus the module firmware-build CI (`hog_central.c`).
+- [x] **M3 — input device.** ✅ Decoded values → `input_report_rel/key` with
+  button edge tracking — **the cursor moves on real hardware.**
+- [x] **Reconnect.** ✅ Bonds persist across reboot and the dongle auto-reconnects
+  after a mouse power-cycle / USB replug with **no re-pairing**
+  (branch `fix/reconnect-directed-adv`).
+- [ ] **M4 — customization.** Axis/scroll `input-processors` + **mouse-button → key**
+  remap — **config-only**, done in a separate `zmk-config` repo. See the roadmap.
+- [ ] **M6 — universal BLE-HID bridge.** BT keyboard support (the central is already
+  HID-generic; remaining work is keyboard interpret + output). See the roadmap.
 - [ ] **M5 — dongle.** Case, daily use.
 
-What is **not** verified yet: anything requiring the physical device. See the
-[device capture](#section-8-capturing-the-ist-pro-hid-reports) step and
-`HANDOFF.md`.
+Session-by-session relay detail lives in [`HANDOFF.md`](./HANDOFF.md).
 
 ## Installing into your zmk-config
 
