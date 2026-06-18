@@ -236,3 +236,69 @@ state without rebuilding): `/Volumes/workspace/.zmk-blehh-build/rollback/`
 Retest log: `/Volumes/workspace/.zmk-blehh-build/freeze-logs/` (live capture was
 `/tmp/retest-rxfix12.log`; copy in if keeping). The motion marker in the logging
 build is `<dbg> zmk: zmk_hid_mouse_movement_set` (NOT the old `report h=` line).
+
+## 11. Conn-param deep dive — RESULT: tuning can only MITIGATE, not cure (2026-06-18 PM, no flash)
+
+A second multi-agent diagnose+verify pass, all load-bearing claims checked
+against the Zephyr source, produced a counterintuitive and decisive conclusion.
+
+- **"Raise the supervision timeout" is BACKWARDS — the comment at `hog_central.c:640-644`
+  is wrong.** During the NESN stall the peer's retransmits are CRC-OK:
+  `lll_conn.c:366` sets `crc_valid=1` on ANY CRC-OK PDU (even below the 3-node ACK
+  reserve, where `lll_conn.c:1144-1150` skips ack/enqueue), and
+  `ull_conn.c:1117-1118` then ZEROES `supervision_expire` every event while
+  crc_valid is set. So the timer is continuously reset by retransmits and 0x08
+  fires ONLY once CRC-valid reception fully stops — a LONGER timeout just lengthens
+  the freeze.
+- **conn-param tuning is a UX MITIGATION, not a cure.** The proven RX-node
+  recycle-throughput limiter is unchanged; 0x08 still occurs under sustained flood
+  (queue-full stays ZERO). The only helpful lever is a SHORTER supervision timeout:
+  the driver auto-reconnects on 0x08, so a shorter timeout converts a long freeze
+  into a quicker recover — at the cost of MORE FREQUENT (but shorter) drops.
+- Mouse is **motion-bound** (one notification per delta, 18-130/s); longer interval
+  cannot reduce report generation, only repack on-air into burstier events with more
+  recycle time between (mild, indirect, empirical). latency must stay 0.
+- A pure **central never auto-applies its own preferred params** (`conn.c:2243-2251`
+  short-circuits for central) and `le_param_req` only fires IF the peer requests a
+  change. So the deterministic lever is a central-forced `bt_conn_le_param_update()`,
+  which works whether the mouse is passive or active.
+
+**Honest bottom line:** the residual freeze under hard sustained motion is a link
+throughput / RF ceiling (self-sustaining NESN stall + retransmit pressure; "RF
+noise?" warnings observed). Firmware conn-params can make each freeze SHORTER, not
+stop the drops. A real cure needs a different layer (better RF/antenna/distance, a
+lower on-air error rate, or accepting the hardware ceiling).
+
+### Refined plan IF pursuing the UX mitigation (needs flashes — get user OK first)
+
+1. **OBSERVE build** (zero behavior change): add a `le_param_updated` LOG_INF
+   (insert at `hog_central.c:746`, register `.le_param_updated` in
+   `BT_CONN_CB_DEFINE` at :750). Learn the real negotiated interval/latency/timeout.
+   Interpret: (a) ~2.5-3 s ⇒ mouse overrode our 5 s; (b) ~5 s/unchanged ⇒ mouse
+   passive, a `le_param_req` clamp would be INERT; (c) neg-reply ⇒ a validity rule
+   was hit. Single info line per (re)negotiation — NOT per-PDU, and do NOT also turn
+   on BT subsystem DBG logging (it perturbs the timing under test, per §3).
+2. **FIX (lead = central-forced update, "FIX-B")**: at discovery-done
+   (`subscribe_pending()` :447-448) call `bt_conn_le_param_update(conn, ...)` with
+   latency=0, interval 12-24 (15-30 ms), supervision **MODERATE first (~250-300 cs,
+   i.e. ≈ the mouse's own value or slightly below)** — NOT 100-150 cs initially: a
+   very short timeout raises drop frequency and every reconnect re-enters the fragile
+   resume-CCC discovery window (observed to wedge → 0-report cycles), risking a
+   reconnect-storm that feels worse than one long freeze. Tighten toward ~150 cs only
+   on a later flash if no storm appears. Keep a `le_param_req` clamp as
+   belt-and-suspenders. Do NOT lower the create-time `BT_LE_CONN_PARAM` at :645 (keep
+   first-connect's -ENOMEM-sensitive 5-CCC discovery robust). Correct the :640-644
+   comment.
+3. Optional reconnect-window hardening: "drop notifications while
+   `disc_state != DISC_IDLE`" (~5 lines, no cache, no handle-staleness). Apply only
+   if a 0-report reconnect wedge still reproduces after the fix. **NOT Candidate-3**
+   (per-bond handle cache): wrong failure mode (one-time discovery window, not the
+   steady-state flood) + re-introduces the stale-handle/-ENOMEM risk class that
+   `AUTO_RESUBSCRIBE=n` was added to remove — do not flash.
+4. **Expectation to set with the user:** long freeze → shorter (and possibly more
+   frequent) blip; the drops themselves are NOT eliminated. If the requirement is
+   "no drops under hard motion," conn-params are the wrong layer.
+
+Full design + adversarial verdicts: workflow run `wf_f0d8d56f-4b4`, output saved at
+`/private/tmp/.../tasks/wyy6pfz9h.output` (FIX-A `le_param_req` body, FIX-B hook,
+validity math, three-way OBSERVE interpretation guide).
