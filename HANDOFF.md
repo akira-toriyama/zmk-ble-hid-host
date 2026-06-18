@@ -28,8 +28,9 @@ ZMK の input subsystem に流す」モジュール。リマップ／出力は Z
   hog_central 移植 ✅（§M2b, P-B' 実機実証）→ M3 publish 実装 ✅（§M3, ビルド green）。
   → M3 publish ✅ P-C 実機実証（カーソルが動く, §6 P-C, 2026-06-18）。次は M4(リマップ)。最終像は §4。**
 - ZMK 本体は fork しない。3層構成（zmk 無改変 + 本モジュール + ユーザ zmk-config）。
-  - ユーザの zmk-config = **`akira-toriyama/canon`**（Cyboard Imprint 分割キーボード）。
-    ただし本ドングルは別デバイス → **M4 で「自己完結 or canon に統合」を選択**（今は canon を触らない）。
+  - ユーザの既存 zmk-config = **`akira-toriyama/canon`**（Cyboard Imprint 分割キーボード）だが、本ドングルは別デバイス。
+    **ドングル用 ZMK 設定は canon 以外の新規 public config リポに切り出す（2026-06-18 決定, §4 次セッション）**。
+    動作安定後に canon 取り込みを検討。**今は canon を触らない。**
 - **実機: ユーザ手元に XIAO nRF52840・Elecom IST PRO あり（焼き/USB/ペアリング等の実機作業は実施可能、2026-06-18 確認）。**
 
 ### 構成（確認済み・2026-06-18）
@@ -269,45 +270,61 @@ logging variant も HID mouse + CDC 両方持つので機能上は同じ。defau
 
 ### 🎯 ユーザの最終像（2026-06-18 確認）— これに向けて進める
 ```
-① ドングルとペアリング状態で「通常操作」可能（カーソルが実際に動く）   ← M2(デコード)+M3(publish)+XIAO用ZMKファーム
-② ZMK でリマップ：例「マウスのボタン4 → キー A」                       ← M4(input-listener/processor/behavior)
-③ ZMK の設定を育てる（継続）                                          ← M4+ ユーザの zmk-config を育成
+① ドングルとペアリング状態で「通常操作」可能（カーソルが動く）       ✅完了（M3, P-C 実機実証）
+② ZMK でリマップ：例「マウスのボタン4 → キー A」                       ← M4（次セッション。別 config リポで）
+③ ZMK の設定を育てる（継続）                                          ← M4+ 別 config リポを育成
+④ 汎用 BLE-HID ブリッジ：一般 BT キーボード/マウスもカバー            ← M6（north star 拡張, §ロードマップ）
 ```
-- **①が次の大関門**: いまの `probe/` は受信ログだけ（カーソルは動かない＝設計通り）。これを ZMK モジュール本体
-  (`drivers/input/`) に移植してデコード(M2)→input subsystem へ publish(M3)→**XIAO 用 ZMK ファームをビルド**して
-  「カーソルが動く」を実機で出す。M1 で HOGP 作法は全部実証済み（§M1 の「HOGP ホスト作法」を移植元にする）。
-- **②の不確定ポイント（要 feasibility 確認）**: ZMK で **マウスのボタンをキーボードキーに化かす**のは入力系と
-  キーマップが別サブシステムなので自明でない。入力プロセッサ/カスタム behavior が要るか、ZMK の pointing/input
-  ドキュメントで先に裏取りすること（移動・スクロール・軸反転/scaling は input-processors で素直に可能）。
-  → 着手前に zmk docs / claude-code-guide で「input event(BTN) → keymap behavior」の現行作法を調べる。
-- **③の置き場所＝M4 の分岐**: 自己完結ドングル config か、ユーザの `akira-toriyama/canon`(Cyboard Imprint)に統合か。
-  ①②を出すだけなら **専用ドングル ZMK ビルドが最短**。canon は M4 まで触らない（§1 方針）。
+- **① ✅達成**（§M3, §6 P-C）。マウスは「任意の HOGP マウス」を実行時 Report Map 解析で受けられる設計（IST PRO で実証）。
+- **②（次セッション）**: ZMK で **マウスのボタンをキーボードキーに化かす**のは入力系とキーマップが別サブシステムなので自明でない。
+  着手前に **zmk docs / claude-code-guide で「input event(BTN) → keymap behavior」の現行作法を裏取り**すること
+  （移動・スクロール・軸反転/scaling は input-processors で素直に可能）。実装は **別 config リポ**で（下記 §次セッション）。
+- **③の置き場所＝決定（2026-06-18）**: ZMK 設定（厳密にはマウス）は **canon 以外の専用 config リポに切り出す**（新規 public, push 可）。
+  動作が安定したら canon 取り込みを検討。canon は当面触らない（§1 方針）。詳細は §次セッション。
 
-### ▶ 次 = P-C 実機確認（👤 tommy）＝ M3 の唯一の残り
+### ▶ 次セッション = M4（別 config リポ作成 → マウスボタン4 → `a` リマップ）
 
-M3 publish はコード完了・ビルド green（§M3, ブランチ `feat/m2-firmware-build` に commit 済み）。あとは**焼いて動かす**だけ。
+M1〜M3 完了（カーソルが動く, P-C ✅）。次は **② リマップを実機で出す**。ユーザのゴール例＝**「マウスのボタン4 → キー `a`」**。
 
-**0.（推奨）先に logging variant でログ確認**: `validate-both.sh` 産物 `/ws/build-log/zephyr/zmk.uf2`（または CI artifact
-   `ble_hid_host_receiver-logging`）を XIAO に焼き、IST PRO を繋ぎ、`cat /dev/cu.usbmodem<XXX>` で
-   `connected`→`secured`→`report map parsed (... report_id=2 ...)`→`subscribed report value=.. ccc=.. id=..`（**id=2 の行があるはず**）
-   →ボール移動で `report h=.. dx=.. dy=..` が出るか確認（§M1 の `cat` background+kill 採取手順流用）。
-   **watch すべき**: ①`ignoring report h=.. id=.. (pointer id=2)` が pointer 以外で出る＝正常（keyboard/consumer を捨てている）。
-   ②`report queue full; dropping` / input queue drop が頻発したら msgq 深さや負荷を見直し。③重複通知が出たら `BT_GATT_SUBSCRIBE_FLAG_NO_RESUB`。
+**Step 1. 別 config リポを作る（決定済・push 認可済 / public OK）**:
+- **canon 以外の新規 public リポ**に ZMK 設定（マウス）を切り出す。動作安定後に canon 取り込みを検討（今は canon を触らない）。
+- 名前案: `zmk-ble-hid-host-config` か `zmk-trackball-dongle` 等（着手時にユーザへ最終確認）。中身＝ZMK user-config:
+  `config/west.yml`（zmk 本体 import ＋ **`akira-toriyama/zmk-ble-hid-host` を module として pin**）、`build.yaml`、
+  自分の overlay/keymap（receiver shield を流用 or 取り込み）。**今 `zmk-ble-hid-host` 内にある receiver shield/build.yaml が雛形**。
+- ビルドは新 config リポの CI（公式 reusable `build-user-config.yml`）で。board=`xiao_ble/nrf52840/zmk`、`.conf` は §M2b と同値
+  （`ZMK_BLE=n`/`ZMK_USB=y`/`ZMK_POINTING=y`/`BT_CENTRAL=y`/`BT_SMP_SC_PAIR_ONLY=n`…）。
+- **モジュール repo（`zmk-ble-hid-host`）はライブラリとして残す**。受信器 shield をモジュール内に残すか config 側へ移すかは着手時判断。
 
-**1. default `.uf2` を焼いて P-C 判定**: `/ws/build/zephyr/zmk.uf2`（または CI default artifact）を **トラックボール用の XIAO** に
-   物理ダブルタップで焼く（§M1 手順。`fcopyfile I/O error` でも焼けている）→IST PRO 接続→**PC のカーソルが動く＝P-C 達成**。
-   ボタン（左/右/中/戻る/進む＝5個）も効くか確認。軸反転/scaling/snipe/scroll は keymap の input-processors で（§M1 `ist_pro.keymap.snippet` 参考）＝M4。
+**Step 2.「マウスボタン4 → `a`」の feasibility を先に裏取り**（⚠️ 自明でない）:
+- マウスボタンは **input subsystem（`INPUT_BTN_0..4`）**、キーボードキーは **keymap/behavior** で**別サブシステム**。
+  「BTN イベント → キーコード `a` 出力」の現行 ZMK 作法を **zmk docs / claude-code-guide で先に調査**（カスタム
+  input-processor か、behavior か、`zmk,input-listener` の機構か）。移動/スクロール/軸反転/scaling/snipe は input-processors で素直。
+- 本モジュール側で「特定ボタンを publish しない（keymap に回す）」等の分岐が要るかも要検討。まず ZMK 標準機構で出来るか確認。
 
-**手戻り時の切り分け**: logging variant で「どこまで出るか」を見る。`report map parsed` が出ない→discovery/Report Map read 問題。
-   `subscribed ... id=2` が無い→0x2908 read 失敗（id=0 になり pointer が ignore される。ただし通知1本なら bypass で動く）。
-   `report h=.. dx=..` は出るがカーソル動かず→publish/listener/USB HID 側（`CONFIG_ZMK_POINTING`/overlay 配線を疑う）。
+**Step 3. 実機**: 新 config リポでビルド→`.uf2` を XIAO に焼く（§M1 焼き手順）→ボタン4で `a` が入力されるか確認。
 
-DoD（M3）: ✅実装→✅ビルド green→**👤 tommy さんが焼いて「カーソルが動く」を実機確認（P-C）**。これで①完了。次は②リマップ＝M4。
-ブランチ: `feat/m2-firmware-build` に M3 を commit（M2b+M3 で一つの「受信→カーソルが動く」PR）。push 認可済み（§8 ＋ 2026-06-18 明示再確認）。
+参考: `input_report_rel/key` 署名 `(dev, code, value, sync, k_timeout_t)`。input コード: `INPUT_REL_X`=0x00 `Y`=0x01 `HWHEEL`=0x06
+`WHEEL`=0x08、`INPUT_BTN_0`=0x100。ローカル両ビルド: `docker run --rm -v <repo>:/repo:ro -v /Volumes/workspace/.zmk-blehh-build:/ws -w /ws zmkfirmware/zmk-build-arm:stable bash /ws/validate-both.sh`。
 
-参考: デコード期待値の正解表は `tests/parser/fixtures/ist_pro.live_reports.hex` のコメント。`input_report_rel/key` 署名は
-`(dev, code, value, sync, k_timeout_t)`（§8 検証済）。input コード値: `INPUT_REL_X`=0x00 `Y`=0x01 `HWHEEL`=0x06 `WHEEL`=0x08、`INPUT_BTN_0`=0x100。
-ローカル両ビルド: `docker run --rm -v <repo>:/repo:ro -v /Volumes/workspace/.zmk-blehh-build:/ws -w /ws zmkfirmware/zmk-build-arm:stable bash /ws/validate-both.sh`。
+### ▶ ロードマップ（拡張・将来）— 2026-06-18 ユーザ確認
+
+**M6（north star 拡張）= 汎用 BLE-HID ブリッジ：一般 BT キーボード/マウスをカバー**:
+- 現状の達成度（正直に）: **ハード非依存 ✅**（nRF52840 系なら可）／**マウス全般 ✅**（実行時 Report Map 解析で任意 HOGP マウス、IST PRO 実証）／
+  **BLE central の土台（scan/接続/bond/discovery/subscribe）は HID 汎用で完成・キーボードにもそのまま効く ✅**（M1 で Imprint キーボードに
+  誤接続したのが証拠）。**残り＝キーボードの「キー解釈＋出力」**（マウスと同規模の追加）:
+  ① `hid_report_parser.c` にキーボード collection（modifier + keycode 配列）抽出を追加、② キーボード decode、
+  ③ **出力経路**＝キーは ZMK の input subsystem 経路ではない。**当面はパススルー**（受けた HID キーボードレポートを USB HID キーボードに
+  そのまま出す）が現実的。キーのリマップは別問題（kscan/keymap 経路で自明でない）。→ M6 として別途スコープ。
+- DoD（M6）: 手持ちの BT キーボードを繋いで USB でタイプできる（まずパススルー）。
+
+**ペアリング方針（cross-cutting, 2026-06-18 決定＝推奨案 C）**: **「pairing モードにしたら自動ペア」を採用、ただしスコープ付き**:
+- **既知ボンドは常に自動再接続**（現状どおり。電源 ON で勝手に繋がる）。
+- **新規ペアは「トリガ後の pairing ウィンドウ」内だけ受け付ける**（例: 起動時ボタン/キー長押し→N 秒だけ新規 scan-to-pair）。
+  これで「ペアリングモードにしたら繋がる」UX を保ちつつ、**隣の Cyboard Imprint キーボードを巻き込まない**（M1 の誤マッチ＝
+  appearance 0x03c1 を掴んだ問題の再来を防ぐ）。device-name 許可リストは補助。
+- **未実装＝将来作業**: 現状は「マウス appearance か既知ボンドを無条件 auto-connect・接続中は他を無視・forget/unpair UX 無し」。
+  M6 でキーボードも match させる時に、このペアリングウィンドウ機構が**必須**（さもないと Imprint を奪う）。
+- 関連: `BT_MAX_PAIRED=2`/`BT_MAX_CONN=1`。デバイス切替は当面「繋ぎたい方だけ電源 ON」or device-name 固定＋再フラッシュ。
 
 手本（ローカル checkout、行番号は変わり得るので関数名で追う）:
 - `…/zmk/app/src/split/bluetooth/central.c` … scan→connect→discover→subscribe の状態機械の正本。
@@ -329,16 +346,16 @@ M1 のサブステップ:
    - 注意: XIAO は board 単体ではキーボードにならないので、最小 shield か keymap/overlay が要る。
      ZMK module の CI 構成（cirque-input-module 等）を参照して詰める。self 参照 west.yml がコツ。
 
-## 5. M2〜M5 概要
+## 5. マイルストーン概要（M2〜M6）
 
-- **M2 デコード**: `hid_report_parser.c`（Report Map item 解析 → field 位置）＋ `hid_report_decode.c`
-  （生レポート＋layout → dx/dy/buttons/wheel）。両方 `hid_report_parser.h` の契約に実装。
-  `tests/parser/` に標準マウス/boot mouse/report-ID 付き/実機採取(§8) の fixture を足し、
-  `Makefile` の `SRCS +=`（コメント済み）を有効化して assert。Boot Protocol フォールバックも。
-- **M3 input device 化**: `ble_hid_host.c` のコメント「M3 publish contract」を実装。
-  ボタンは前回マスクとの差分でエッジ送出、最後の event に `sync=true`。
-- **M4 配線**: `config-example/` を実機で詰めて README に確定値。input-processors で軸反転/scaling/snipe/scroll。
+- **M2 デコード ✅**: `hid_report_parser.c`（Report Map 解析→field 位置）＋ `hid_report_decode.c`（生レポート＋layout→dx/dy/buttons/wheel）。
+  ホスト単体テスト green（§M2）。
+- **M3 publish ✅**: `ble_hid_host.c` の publish 実装＋Report Reference(0x2908) report-ID マッチング＋layout atomic 化。実機 P-C ✅（§M3, §6）。
+- **M4 リマップ（次セッション）**: **別 config リポ**作成（canon 以外, public）＋ input-processors（軸反転/scaling/snipe/scroll）＋
+  **マウスボタン4 → キー `a`**。BTN→keymap behavior の作法は着手前に裏取り（§4 次セッション）。
 - **M5 ドングル**: ケース・常用（物理作業）。
+- **M6 汎用 BLE-HID ブリッジ（north star 拡張）**: 一般 BT キーボード/マウス対応。central 土台は完成・残りはキーボードの
+  キー解釈＋出力（まずパススルー）＋ペアリングウィンドウ機構（§4 ロードマップ）。
 
 ## 6. 実機作業フェーズ（👤 ユーザ担当 / XIAO・IST PRO 手元あり）
 
