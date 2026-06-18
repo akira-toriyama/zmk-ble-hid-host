@@ -13,7 +13,7 @@
 誤デコードされる窓を封鎖）、⑤ disconnect で `ble_hid_host_reset`（押下中ボタンが PC に latch するのを解除）、
 ⑥ ドロップしたボタン edge は `prev_buttons` を進めない（applied マスク）、⑦ 単一 report 機は id チェック bypass。
 **default + logging 両 `.uf2` が Docker で green**（FLASH 24.4%/RAM 15.6%）。詳細 §M3。
-**残るは P-C（実機でカーソルが動くか）の確認のみ → その後 M4（リマップ）。** 設計の続きは §4。）
+**M3 完了 ✅ = P-C 実機実証（カーソルが動く, 2026-06-18, §6 P-C）。次は M4（リマップ）。** 設計の続きは §4。）
 計画書: `/Users/tommy/.claude/plans/distributed-hatching-hejlsberg.md`
 元ブリーフ: `/Users/tommy/Downloads/zmk-ble-hid-host-brief.md`
 
@@ -26,7 +26,7 @@ ZMK の input subsystem に流す」モジュール。リマップ／出力は Z
 
 - **現在のマイルストーン: M0 → M1 ✅（受信を実機実証, §M1）→ M2 デコード核 ✅（§M2）→ M2b ファームビルド CI +
   hog_central 移植 ✅（§M2b, P-B' 実機実証）→ M3 publish 実装 ✅（§M3, ビルド green）。
-  次は P-C（実機でカーソルが動くか）の確認 → M4(リマップ)。最終像は §4。**
+  → M3 publish ✅ P-C 実機実証（カーソルが動く, §6 P-C, 2026-06-18）。次は M4(リマップ)。最終像は §4。**
 - ZMK 本体は fork しない。3層構成（zmk 無改変 + 本モジュール + ユーザ zmk-config）。
   - ユーザの zmk-config = **`akira-toriyama/canon`**（Cyboard Imprint 分割キーボード）。
     ただし本ドングルは別デバイス → **M4 で「自己完結 or canon に統合」を選択**（今は canon を触らない）。
@@ -231,8 +231,10 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
 （`validate-both.sh`）。`nm` で `ble_hid_host_publish`/`ble_hid_host_reset`/`k_msgq_purge` link 確認。**ホスト純粋核テストは無改変で
 そのまま（M2 の parser/decoder は変更なし）。**
 
-**残り = P-C のみ**: tommy さんが default `.uf2`（または先に logging variant でログ確認）を XIAO に焼いて
-「カーソルが動く」を実機確認（§6 P-C）。手戻りが出たら §M1 採取手順 + logging ログで切り分け。
+**P-C 実機実証 ✅（2026-06-18）**: logging variant を焼き、IST PRO 自動再接続（ボンド永続）→ `report map parsed report_id=2`→
+5本 subscribe（各 0x2908 から id=1/2/6/4/9 取得）→ボール移動で `report h=49 dx/dy` 1432件・左/右ボタン。**publish 全件 h=49(id=2)のみ
+＝id フィルタ実機実証**。tommy さん「動作OK」＝カーソルが動いた。→ **M3 完了。次は M4。**（production 用に default `.uf2` を焼くのは任意＝
+logging variant も HID mouse + CDC 両方持つので機能上は同じ。default は CDC 無しで軽い。）
 
 ## 2. 完了（M0）＝ 検証済み
 
@@ -361,7 +363,10 @@ M1 のサブステップ:
       Report Map 解析(read-long 320B)/ デコードが全部実機で正しいと確定**（M3 の手戻りリスク消滅）。
       軽微: subscribe 中に `bt_conn: Not enough buffer space for L2CAP data` が2回（自己回復、5本 subscribe 成功。M3 で
       負荷増えたら `CONFIG_BT_L2CAP_TX_BUF_COUNT`/`BT_BUF_ACL_*` 増を検討）。pointer は report_id=2＝value handle 49。
-- [ ] **P-C M3 動作確認** 👤  PC で実際にカーソルが動くか。
+- [x] **P-C M3 動作確認 ✅（2026-06-18）= カーソルが動く**。logging variant `.uf2`（`build-log/zephyr/zmk.uf2`）を XIAO に焼き、
+      IST PRO **自動再接続**（ボンド永続）→ `report map parsed report_id=2`→**5本 subscribe（各 0x2908 から id=1/2/6/4/9 を正しく取得）**
+      →ボール移動で `report h=49 dx/dy` 1432件、左ボタン `0x0001`×107・右 `0x0002`×2。**publish は全件 h=49(id=2)のみ＝id フィルタ実機実証
+      （非ポインタ report のゴミ移動ゼロ）**。tommy さん「動作OK」＝**PC カーソルが実際に動いた**。→ ①「カーソルが動く」完了。次は M4。
 - [ ] **P-D M4 調整** 👤  リマップ(軸反転/swap/scaling/snipe/scroll)が効くか、processor パラメータ実調整。
 - [ ] **P-E M5 常用** 👤  ケース装着・常用。
 
