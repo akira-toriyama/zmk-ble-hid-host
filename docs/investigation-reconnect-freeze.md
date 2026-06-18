@@ -162,3 +162,77 @@ Key timeline (from `verify.log`, firmware uptime):
 - Local Zephyr to read: `/Volumes/workspace/github.com/zmkfirmware/zmk/zephyr`
   (`subsys/bluetooth/controller/ll_sw/nordic/lll/lll_conn.c`, `.../ull_conn.c`,
   `subsys/bluetooth/host/`).
+
+## 9. RX 12/10 experiment — RESULT: partial improvement, NOT a cure (2026-06-18 PM)
+
+Acting on a multi-agent diagnose+verify pass (see below), we **refuted the
+thread-starvation hypothesis** and bumped only the proven-mechanism knobs:
+`CONFIG_BT_CTLR_RX_BUFFERS` 6→12 (controller PDU pool 9→15) and
+`CONFIG_BT_BUF_ACL_RX_COUNT_EXTRA` 6→10 (host ACL pool 7→11). Deliberately did
+**not** touch the deprecated `BT_BUF_ACL_RX_COUNT` base, and did **not** add a
+dedicated workqueue / notify_cb early-drop (those harden the refuted concern).
+
+**Why the thread-starvation hypothesis is dead** (verified against the generated
+`.config`): sys-wq priority = -1, BT RX WQ = `K_PRIO_COOP(8)` = -8, both
+cooperative, `BT_RECV_WORKQ_BT` (BT RX on its own workqueue). -8 is strictly
+higher priority than -1, so the heavy `report_work` consumer can never starve the
+BT RX thread that recycles RX nodes; the depth-16 `report_msgq` (K_NO_WAIT)
+fully decouples them. The real gate is purely the controller:
+`lll_conn.c:1143-1150` only ACKs (nesn++) when `ull_pdu_rx_alloc_peek(3) != 0`.
+
+**On-device retest (logging build, same immediate-aggressive-move repro). Result
+matches the verifiers' prediction exactly — buffers raise BURST absorption, not
+steady-state throughput:**
+- Idle is now rock-solid: a ~2.5-min connection with only light/no motion never
+  dropped (pre-fix it dropped every 7-15 s regardless).
+- Under sustained aggressive movement it STILL drops with reason 0x08, but
+  survival is ~2-4× longer at a comparable rate:
+
+  | rate | pre-fix (RX 6/6) survival | post-fix (RX 12/10) survival |
+  |---|---|---|
+  | ~100/s | 1.6-2.1 s | 75/s → 8.8 s |
+  | ~130/s | 2.8 s | 121/s → 4.5 s |
+
+- `report queue full` warnings: **still ZERO** — the host consumer keeps up, so
+  the limiter is NOT host-side msgq/throughput; it is the controller RX-node
+  recycle rate / on-air retransmit dynamics.
+- Every drop has the same shape: **motion stops first (cursor freezes), then
+  ~2.5-3.0 s later the formal 0x08**. A few reconnect cycles delivered 0 reports
+  before 0x08 (link wedged from the resume-CCC flood during discovery).
+
+**Verdict: do NOT keep bumping buffers** (12→18 would only extend survival a
+little). RX 12/10 is kept as a strict improvement over 6/6 (no downside, idle is
+now stable) and committed as the new baseline, but the residual freeze needs a
+**throughput / connection-parameter** lever, not more pool depth.
+
+## 10. NEW lead — connection parameters are unobserved and uncontrolled
+
+`hog_central.c:645` REQUESTS `BT_LE_CONN_PARAM(6, 12, 0, 500)` = interval
+7.5-15 ms, latency 0, supervision 5 s. But there is **no `.le_param_req` and no
+`.le_param_updated` callback** registered (`BT_CONN_CB_DEFINE` at :747 has only
+connected/disconnected/security_changed). So:
+- We **blindly accept** whatever conn-param-update the IST PRO requests after
+  connect, and we **never log the negotiated values**.
+- The ~2.5-3.0 s freeze→0x08 gap strongly implies the *actually negotiated*
+  supervision timeout is ~2.5-3 s, i.e. the mouse **overrode our 5 s request**.
+  So both the on-air PDU rate (interval) and the timeout are currently the
+  mouse's choice.
+
+**Next step (DIAGNOSE BEFORE CHANGING, needs one flash — get user OK first):**
+add a one-line `LOG_INF` in a `.le_param_updated` callback to print the real
+negotiated interval/latency/timeout. Then decide the fix — leading candidate is a
+`.le_param_req` that clamps the request (enforce a larger supervision timeout
+so a transient RX stall is ridden through, and/or a slightly longer interval to
+cut the on-air PDU rate the recycle pipeline must sustain). Latency must stay 0.
+Secondary candidate (candidate 3 above): cache parsed layout+handles per bonded
+peer to skip the report-map read on reconnect — helps the "0-report, wedged from
+reconnect" cycles, not the mid-motion drops.
+
+**Rollback artifacts** (so the device can always be restored to this best-known
+state without rebuilding): `/Volumes/workspace/.zmk-blehh-build/rollback/`
+- `rx12-10_default.uf2` — production firmware (RX 12/10, no logging).
+- `rx12-10_logging.uf2` — same + USB logging (currently flashed).
+
+Retest log: `/Volumes/workspace/.zmk-blehh-build/freeze-logs/` (live capture was
+`/tmp/retest-rxfix12.log`; copy in if keeping). The motion marker in the logging
+build is `<dbg> zmk: zmk_hid_mouse_movement_set` (NOT the old `report h=` line).
