@@ -1,0 +1,31 @@
+# Real Elecom IST PRO HID input reports captured over BLE (HOGP) by the M1 probe
+# on 2026-06-18. These are the raw notification payloads from the mouse's Report
+# characteristic (HID svc 0x1812, value handle 41) — NO report-ID prefix (HOGP
+# delivers each report on its own characteristic). 7 bytes each, decoded per the
+# captured Report Map (fixtures/ist_pro.report_map.hex):
+#
+#   byte0      buttons  bitmask, buttons 1..8 (bit0 = button1/left)
+#   byte1..2   dx       int16 little-endian
+#   byte3..4   dy       int16 little-endian
+#   byte5      wheel    int8 (vertical scroll; +up / -down)
+#   byte6      AC Pan   int8 (horizontal scroll; +right / -left)
+#
+# One report per line (14 hex chars). Trailing comment after '#'.
+# M2 (hid_report_decode.c) must turn each of these into the documented deltas.
+
+003b00f0ff0000   # move: dx=+59  dy=-16
+00feff08000000   # move: dx=-2   dy=+8
+001300ffff0000   # move: dx=+19  dy=-1
+010000ffff0000   # button1 (left)  + dy=-1
+020000ffff0000   # button2 (right) + dy=-1
+03000001000000   # buttons 1+2 chord + dy=+1
+100000feff0000   # button5 + dy=-2
+20000000000000   # button6 (no motion)
+40000000000000   # button7 (no motion)
+800000ffff0000   # button8 + dy=-1
+820000ffff0000   # buttons 2+8 chord + dy=-1
+00000000000100   # wheel +1 (scroll up)
+0000000000ff00   # wheel -1 (scroll down)
+00000000000001   # AC pan +1 (scroll right)
+000000000000ff   # AC pan -1 (scroll left)
+00000000000000   # idle / all-release (buttons up, no motion)

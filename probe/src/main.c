@@ -266,7 +266,11 @@ static bool ad_parse_cb(struct bt_data *data, void *user_data)
 		for (int i = 0; i + 1 < data->data_len; i += 2) {
 			if (sys_get_le16(&data->data[i]) == BT_UUID_HIDS_VAL) {
 				ai->has_hids = true;
-				ai->match = true;
+				/* Advertising the HID service alone is NOT enough to target:
+				 * a nearby ZMK keyboard dongle (Imprint Dongle, appearance
+				 * 0x03c1) also advertises HIDS and would hijack the probe
+				 * (and waste cycles failing to pair). Require a mouse
+				 * appearance or an IST/ELECOM name below. */
 			}
 		}
 		break;
@@ -327,9 +331,16 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	bt_addr_le_to_str(addr, s, sizeof(s));
 	bt_data_parse(ad, ad_parse_cb, &ai);
 
-	/* Log each distinct advertiser once (and again when we first learn its
-	 * name) so the IST PRO can be told apart from other BLE HID devices. */
-	if (should_log(addr, ai.name[0] != '\0')) {
+	/* Only bother with advertisers that carry a name, the HID service, or
+	 * match — the air is full of no-name RPA beacons whose rotating addresses
+	 * would otherwise overflow seen[] (MAX_SEEN), break the dedup, and spam the
+	 * deferred log buffer hard enough to drop the SMP pairing trace. */
+	bool interesting = ai.match || ai.has_hids || ai.name[0] != '\0';
+
+	/* Log each distinct interesting advertiser once (and again when we first
+	 * learn its name) so the IST PRO can be told apart from e.g. the Imprint
+	 * keyboard dongle (which now shows has_hids 1 but match 0). */
+	if (interesting && should_log(addr, ai.name[0] != '\0')) {
 		LOG_INF("saw %s rssi %d name '%s' appearance 0x%04x hids %d match %d", s,
 			rssi, ai.name, ai.appearance, ai.has_hids, ai.match);
 	}
@@ -409,8 +420,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	LOG_INF("connected: %s", s);
 
-	/* HID reads / CCC writes are encryption-gated — raise security, do NOT
-	 * start discovery here. Discovery begins in security_changed. */
+	/* Request L2 (encryption, unauthenticated) — NOT L3. The IST PRO is
+	 * NoInputNoOutput and LE-legacy (SMP Pairing Response io 0x03, auth_req
+	 * 0x01: SC=0, MITM=0), so Just Works is the only possible method. Asking
+	 * for MITM (L3) is fatal: SMP aborts with "Authentication Requirements"
+	 * because a NoInputNoOutput peer can never satisfy MITM. Legacy pairing is
+	 * permitted via BT_SMP_SC_PAIR_ONLY=n. Discovery is encryption-gated, so it
+	 * begins only in security_changed. */
 	err = bt_conn_set_security(conn, BT_SECURITY_L2);
 	if (err) {
 		LOG_ERR("set security failed (%d)", err);
@@ -470,14 +486,17 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.le_param_updated = le_param_updated,
 };
 
-/* ───────────────────────── pairing callbacks (Just Works) ──────────────── */
+/* ─────────────── pairing callbacks (NoInputNoOutput → Just Works) ───────────
+ * The IST PRO is NoInputNoOutput and LE-legacy, so the only viable method is
+ * Just Works (unauthenticated). Registering only .cancel keeps our IO caps at
+ * NoInputNoOutput and keeps us out of MITM methods the mouse cannot complete. */
 static void auth_cancel(struct bt_conn *conn)
 {
 	ARG_UNUSED(conn);
 	LOG_INF("pairing cancelled");
 }
 
-/* Only .cancel is set -> NoInputNoOutput -> Just Works. */
+/* Only .cancel set => NoInputNoOutput => Just Works. */
 static struct bt_conn_auth_cb auth_cb = {
 	.cancel = auth_cancel,
 };

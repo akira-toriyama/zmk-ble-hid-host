@@ -3,8 +3,9 @@
 > セッションをまたいで作業を継続するための正本。**未達成を暗黙にしない**。
 > 各セッション終了時にここを更新する。会話言語は日本語。
 
-最終更新: 2026-06-18（**M1 実機進行中**: HOGP プローブ `probe/` を実機で boot/scan/connect 確認、
-ボンドは未達。CI＋Docker ローカルビルドの両方で flashable な .uf2 が出る状態。詳細は §M1）
+最終更新: 2026-06-18（**M1 達成 ✅**: HOGP プローブ `probe/` を実機で boot→scan→connect→**bond→
+discovery→subscribe→HID レポート受信**まで全通し。ボール移動/全ボタン/縦ホイール/横スクロールの
+生バイトを実機採取し M2 fixture 化。ボンド成立の決め手＝**レガシー Just Works 許可**（下記 §M1）。詳細は §M1）
 計画書: `/Users/tommy/.claude/plans/distributed-hatching-hejlsberg.md`
 元ブリーフ: `/Users/tommy/Downloads/zmk-ble-hid-host-brief.md`
 
@@ -15,7 +16,7 @@
 XIAO nRF52840 を「BLE トラックボール(Elecom IST PRO)を BLE central で受け、デコードして
 ZMK の input subsystem に流す」モジュール。リマップ／出力は ZMK 本体に丸投げ（受信専用）。
 
-- **現在のマイルストーン: M0 完了 → M1 実機進行中（§M1 参照）。**
+- **現在のマイルストーン: M0 完了 → M1 達成 ✅（受信を実機実証, §M1）→ 次は M2(デコード)+M3(publish)。最終像は §4。**
 - ZMK 本体は fork しない。3層構成（zmk 無改変 + 本モジュール + ユーザ zmk-config）。
   - ユーザの zmk-config = **`akira-toriyama/canon`**（Cyboard Imprint 分割キーボード）。
     ただし本ドングルは別デバイス → **M4 で「自己完結 or canon に統合」を選択**（今は canon を触らない）。
@@ -53,21 +54,46 @@ xiao_ble 用に scan→接続→ボンド(Just Works/NIO)→全 HID input report
   `cat /dev/cu.usbmodem21101 > /tmp/p.log 2>&1 & CPID=$!; sleep 15; kill $CPID` の background+kill で数秒キャプチャ
   →`sed -E 's/\x1b\[[0-9;]*m//g'` で ANSI 除去して読む（ポート open で起動時 DTR 待ち~10s が解除されログが流れる）。
 
-**実機結果（2026-06-18）**:
-- ✅ build/flash/boot/USB-log/BT有効/scan/**connect** まで全部実機で動作確認（こちらで `cat /dev/cu...` 採取）。
-- ❌ **ボンド未達**。近傍の BLE HID 2台（`EA:36:99:14:56:4E`, `CD:CF:BF:79:9C:00`、いずれも random）に
-  繋ぐが SMP `peer reason 0x8`（unspecified）で拒否。＝相手がペアリング受付状態でない or 別デバイス
-  （**Cyboard Imprint** も BLE HID でフィルタに合致しうる）。IST PRO がどれか名前で未確認だった。
-- → **probe v2** を投入（main.c）: ①全アドバタイザの**名前/appearance/HIDS をログ**(`saw ...`、dedup)
-  ②ペアリング失敗で**即 disconnect**（旧版は ~100s 居座り無言だった）③失敗アドレスを 8s **クールダウン**して巡回。
-  v2 は CI green + Docker 済み、`probe/firmware/zephyr.uf2` に配置済み。
+**実機結果（2026-06-18, M1 達成 ✅）**:
+- ✅ build/flash/boot/USB-log/BT有効/scan/connect/**bond/discovery/subscribe/HID 受信** 全通し（実機）。
+  接続先は `CD:CF:BF:79:7E:00 (random)` name `IST PRO` appearance `0x03c2`(mouse)。
+  HID svc handles 27..73、**notifiable report 5本**(value handle 41/49/56/60/64)に subscribe、
+  **ボール移動で `HID report` の hexdump が 4500+ 件**流れた。`subscribed to 5 report(s)`。
+- ✅ **7.5ms 接続間隔 受諾**（`conn params: interval=6 (7.50 ms) latency=44 timeout=2160 ms`）＝§6/§7 の懸案が解消。
+- 採取した生バイト（7B、report-ID 無し）を全フィールド裏取りして fixture 化
+  → `tests/parser/fixtures/ist_pro.live_reports.hex`（move/全ボタン1-8/縦wheel/横ACpan/idle）。
+  **byte0=buttons(bit0=左), 1-2=dx int16LE, 3-4=dy int16LE, 5=wheel int8, 6=ACpan int8**（HANDOFF §6 の Report Map と一致）。
 
-**次の一手（実機・ユーザ）**:
-1. v2 を焼き直す → IST PRO を**空き BT スロットでペアリングモード**（青点滅）。
-2. シリアルの `saw <addr> name '<name>'` で **IST PRO を名前で特定**（Imprint と区別）。在不在＆ペアリングモードか確認。
-3. ボンド成功 → discovery → **HID report の hexdump**（ボール移動）＝**M1 達成**。
-   失敗が続くなら main.c のフィルタを「名前 IST/ELECOM のみ」等に絞って焼き直す。
-- **採取した HID report 生バイト＋既存の Report Map(`tests/parser/fixtures/ist_pro.report_map.hex`)が M2 デコーダの実機テスト材料。**
+**ボンド失敗→成功の決定的知見（蒸し返さない）**:
+- 真因は **`CONFIG_BT_SMP_SC_PAIR_ONLY` が Zephyr 既定 y** で、プローブが **LE Secure Connections 必須**に
+  なっていたこと。**IST PRO は LE レガシー専用**（SMP Pairing Response = `io 0x03`(NoInputNoOutput),
+  `auth_req 0x01`: **SC=0 / MITM=0**）なので、SC 必須要求を `status 0x03`(Authentication Requirements,
+  = `bt_security_err 4`)で蹴っていた。macOS が繋がったのはレガシーにフォールバックできるから。
+- **誤った遠回り（やらない）**: DisplayYesNo + 数値自動承認 + `L3`(MITM要求) は逆効果。NoInputNoOutput 相手に
+  MITM を要求すると SMP が自分で `err 4` を出す（MITM 不能）。マウスに MITM は原理的に無理。
+- **正しい直し**（`probe/` に投入済み・実機で bond 成功を確認）:
+  ① `prj.conf`: **`CONFIG_BT_SMP_SC_PAIR_ONLY=n`**（レガシー許可＝本丸）＋ `CONFIG_LOG_BUFFER_SIZE=4096`
+     ＋ `CONFIG_BT_SMP_LOG_LEVEL_DBG=y`（SMP の io/auth_req/status を可視化。bond 後は外してよい）。
+  ② `main.c connected()`: `bt_conn_set_security(conn, **BT_SECURITY_L2**)`（MITM 要求しない＝Just Works）。
+  ③ `main.c`: 認証コールバックは **`.cancel` のみ＝NoInputNoOutput**（passkey 系は付けない）。
+  ④ ターゲット選別: `device_found`/`ad_parse_cb` で **HID service 広告だけでは match させない**
+     （隣の **Imprint Dongle**=keyboard `0x03c1` が誤マッチして接続を奪っていた）。
+     **appearance==mouse(0x03c2) か name に IST/ELECOM** のみ match。`saw` ログは match/HID/named のみ
+     （無名 RPA の洪水で seen[] が溢れ dedup 崩壊＋ログバッファ溢れで SMP trace が消える対策）。
+
+**M1 で確定した HOGP ホスト作法（M2/M3 の ZMK モジュール移植にそのまま効く）**:
+- 接続後すぐ discovery しない。`connected`→`bt_conn_set_security(L2)`→**`security_changed` で初めて discovery**
+  （HID read/CCC write は暗号化ゲート）。各 subscribe params は **個別 long-lived**（共有グローバル禁止）。
+- レガシー Just Works を許可（`SC_PAIR_ONLY=n`）＋ NoInputNoOutput。ZMK 本体側 BT 設定との整合は M4 で要確認。
+
+**実機フラッシュ手順（このセッションで確立・Claude が Mac から実施可）**:
+- 1200bps タッチ（`stty -f <port> 1200` を open→close）は**当機では不安定**（成否まちまち）。
+  **物理ダブルタップが確実**: `XIAO-SENSE` がマウント→`cp firmware/zephyr.uf2 /Volumes/XIAO-SENSE/CURRENT.UF2`。
+  `cp` が `fcopyfile: Input/output error` を出しても**焼けている**（UF2 は最終ブロックで即リブートするため正常）。
+  ドライブ出現を 0.5s ポーリングして即コピーする監視スクリプトで自動化した（`/tmp/flash_watch*.sh` 方式）。
+- 焼き直すと CDC ポート名が変わる（`usbmodem21101`↔`21201`）。**幽霊ノードに注意**：片方は前ファームのバナー
+  (`58a5874a446a`)をバッファした 0/46B の死にノード。`=== XIAO HOGP probe ===` と `LE SC enabled` が
+  流れる方が live（このセッションでは `21101`）。採取は `cat /dev/cu.<live> > /tmp/x.log &` → 後で読む。
 
 ## 2. 完了（M0）＝ 検証済み
 
@@ -96,9 +122,32 @@ xiao_ble 用に scan→接続→ボンド(Just Works/NIO)→全 HID input report
 - [ ] `config-example/zmk-config.conf.snippet` の Kconfig 一式は名前を Zephyr 4.1 で確認済みだが、
       **同時有効化でビルドが通るかは未検証**（M1 のファームビルドで確定する）。
 
-## 4. 次にやること（M1 = 受信。最大の関門）
+## 4. 次にやること
 
-ブランチ `feat/m1-hog-central` を切って実装 → PR。DoD = ファームビルド CI green ＋ コードレビュー。
+### 🎯 ユーザの最終像（2026-06-18 確認）— これに向けて進める
+```
+① ドングルとペアリング状態で「通常操作」可能（カーソルが実際に動く）   ← M2(デコード)+M3(publish)+XIAO用ZMKファーム
+② ZMK でリマップ：例「マウスのボタン4 → キー A」                       ← M4(input-listener/processor/behavior)
+③ ZMK の設定を育てる（継続）                                          ← M4+ ユーザの zmk-config を育成
+```
+- **①が次の大関門**: いまの `probe/` は受信ログだけ（カーソルは動かない＝設計通り）。これを ZMK モジュール本体
+  (`drivers/input/`) に移植してデコード(M2)→input subsystem へ publish(M3)→**XIAO 用 ZMK ファームをビルド**して
+  「カーソルが動く」を実機で出す。M1 で HOGP 作法は全部実証済み（§M1 の「HOGP ホスト作法」を移植元にする）。
+- **②の不確定ポイント（要 feasibility 確認）**: ZMK で **マウスのボタンをキーボードキーに化かす**のは入力系と
+  キーマップが別サブシステムなので自明でない。入力プロセッサ/カスタム behavior が要るか、ZMK の pointing/input
+  ドキュメントで先に裏取りすること（移動・スクロール・軸反転/scaling は input-processors で素直に可能）。
+  → 着手前に zmk docs / claude-code-guide で「input event(BTN) → keymap behavior」の現行作法を調べる。
+- **③の置き場所＝M4 の分岐**: 自己完結ドングル config か、ユーザの `akira-toriyama/canon`(Cyboard Imprint)に統合か。
+  ①②を出すだけなら **専用ドングル ZMK ビルドが最短**。canon は M4 まで触らない（§1 方針）。
+
+### ▶ 次セッション = 最低でも M2（ユーザ指示 2026-06-18:「別セッションでOK／少なくとも M2」）
+- **M2 = デコード**: `probe/src/main.c` の HOGP 受信ロジック（scan→connect→**security_changed で discovery**→
+  subscribe）を ZMK モジュール `drivers/input/` に移植しつつ、`hid_report_parser.c` + `hid_report_decode.c` を
+  `include/zmk_ble_hid_host/hid_report_parser.h` の契約に実装。
+- テスト: `tests/parser/fixtures/ist_pro.report_map.hex`(Report Map) と **`ist_pro.live_reports.hex`(実機レポート)** を
+  fixture に assert（`tests/parser/Makefile` の `SRCS +=` を有効化 → `make -C tests/parser test`）。
+  期待値は `ist_pro.live_reports.hex` のコメント（dx/dy/buttons/wheel/pan）がそのまま正解表。
+- ブランチ運用案: `feat/m2-decode` を切って実装 → PR。DoD = ホストテスト green ＋（できれば）ファームビルド CI。
 
 実装ファイル（新規）: `drivers/input/hog_central.c`（`drivers/input/CMakeLists.txt` のコメント済み行を有効化）。
 
@@ -146,9 +195,9 @@ M1 のサブステップ:
 - [ ] **P-A 残（PacketLogger 不要に。M1 で吸収）**: 実 BLE 通知の生バイト（report-ID の有無/実バイト順）は **M1 の `LOG_HEXDUMP`** で取得。
       **アドレス種別(RPA か)/再接続広告/NoInputNoOutput 受諾は macOS では確認不可 → 真のゲートは XIAO の M1 ファーム。**
       （passkey が macOS で出ても NO-GO ではない＝NIO 中央は Just Works に解決。）
-- [ ] **P-B M1 動作確認**（🤖 が焼ける .uf2＋ファームビルド CI を用意した後） 👤
-      .uf2 を XIAO に焼く（リセット2回でブートローダのドライブ表示 → .uf2 を D&D）→
-      USB シリアルでログ確認 → IST PRO をペアリングモードに → 接続して**生レポートがログに出るか**。
+- [x] **P-B M1 動作確認 ✅（2026-06-18）**。物理ダブルタップで `probe/firmware/zephyr.uf2` を焼き、
+      `cat /dev/cu.<live>` でログ採取。IST PRO をペアリングモードに → **bond→subscribe→生レポート 5742件**確認。
+      決め手はレガシー許可（§M1）。7.5ms 接続間隔も受諾。fixture = `tests/parser/fixtures/ist_pro.live_reports.hex`。
 - [ ] **P-C M3 動作確認** 👤  PC で実際にカーソルが動くか。
 - [ ] **P-D M4 調整** 👤  リマップ(軸反転/swap/scaling/snipe/scroll)が効くか、processor パラメータ実調整。
 - [ ] **P-E M5 常用** 👤  ケース装着・常用。
