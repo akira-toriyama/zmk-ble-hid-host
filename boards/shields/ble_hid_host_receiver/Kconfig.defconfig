@@ -1,0 +1,9 @@
+# Copyright (c) 2026 akira-toriyama
+# SPDX-License-Identifier: MIT
+
+if SHIELD_BLE_HID_HOST_RECEIVER
+
+config ZMK_KEYBOARD_NAME
+    default "IST PRO Dongle"
+
+endif

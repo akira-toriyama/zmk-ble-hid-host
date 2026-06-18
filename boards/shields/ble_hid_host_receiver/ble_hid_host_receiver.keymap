@@ -1,0 +1,21 @@
+/*
+ * Copyright (c) 2026 akira-toriyama
+ * SPDX-License-Identifier: MIT
+ *
+ * The dongle has no physical keys (mock kscan, 0 events), so a single
+ * transparent/no-op binding is all ZMK needs to build a valid keymap.
+ * Mouse remapping/processors are layered on the &trackball_listener, not here.
+ */
+
+#include <behaviors.dtsi>
+#include <dt-bindings/zmk/keys.h>
+
+/ {
+    keymap {
+        compatible = "zmk,keymap";
+
+        default_layer {
+            bindings = <&none>;
+        };
+    };
+};

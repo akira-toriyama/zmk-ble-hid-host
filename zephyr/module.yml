@@ -4,3 +4,7 @@ build:
   kconfig: Kconfig
   settings:
     dts_root: .
+    # Expose this repo's boards/ so the bundled receiver shield
+    # (boards/shields/ble_hid_host_receiver) is discoverable when the repo is
+    # injected via -DZMK_EXTRA_MODULES during a ZMK firmware build.
+    board_root: .

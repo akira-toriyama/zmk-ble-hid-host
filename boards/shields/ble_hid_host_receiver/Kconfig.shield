@@ -1,0 +1,5 @@
+# Copyright (c) 2026 akira-toriyama
+# SPDX-License-Identifier: MIT
+
+config SHIELD_BLE_HID_HOST_RECEIVER
+    def_bool $(shields_list_contains,ble_hid_host_receiver)
