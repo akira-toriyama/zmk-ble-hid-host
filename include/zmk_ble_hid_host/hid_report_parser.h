@@ -43,9 +43,10 @@ struct zmk_hid_pointer_report {
 /**
  * Location of one logical field inside a raw input report.
  *
- * Bit offsets are measured from the start of the report payload (i.e. AFTER the
- * leading report-ID byte, when the report has one). bit_size == 0 means the
- * field is absent from this report.
+ * Bit offsets are measured from the start of the HOGP notification payload.
+ * HOGP delivers each report on its own GATT Report characteristic, so the
+ * payload carries NO leading report-ID byte -- offset 0 is the first field bit.
+ * bit_size == 0 means the field is absent from this report.
  */
 struct zmk_hid_field {
     uint16_t bit_offset;
@@ -58,7 +59,11 @@ struct zmk_hid_field {
  * HID Report Map (GATT characteristic 0x2A4B).
  */
 struct zmk_hid_report_layout {
-    uint8_t report_id;            /**< 0 == reports carry no report-ID byte. */
+    uint8_t report_id;            /**< Report ID this layout describes (0 == the
+                                   *   device uses no report IDs). Identifies which
+                                   *   Report characteristic carries this layout
+                                   *   (matched via the Report Reference descriptor);
+                                   *   the HOGP payload itself does NOT include it. */
     struct zmk_hid_field x;
     struct zmk_hid_field y;
     struct zmk_hid_field wheel;
@@ -90,11 +95,13 @@ int zmk_hid_parse_report_map(const uint8_t *report_map, size_t len,
  * Decode one raw input report using a previously parsed layout.
  *
  * @param layout  Layout produced by zmk_hid_parse_report_map().
- * @param report  Raw input-report bytes as received over GATT notification.
- * @param len     Length of @p report in bytes.
+ * @param report  Raw HOGP input-report notification payload (no leading
+ *                report-ID byte -- see struct zmk_hid_field).
+ * @param len     Length of @p report in bytes. Trailing bytes beyond the
+ *                fields the layout models are ignored.
  * @param out     Decoded pointer report.
- * @return 0 on success, negative if the report does not match the layout
- *         (e.g. report-ID mismatch or too short).
+ * @return 0 on success, negative if the layout is invalid or @p report is
+ *         shorter than the layout requires.
  *
  * Pure function (no Zephyr deps). Implemented in M2.
  */

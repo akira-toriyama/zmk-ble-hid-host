@@ -17,6 +17,7 @@ probe/firmware/
 
 # Host test binary
 tests/parser/test_runner
+*.dSYM/
 
 # Editor / OS
 .DS_Store
