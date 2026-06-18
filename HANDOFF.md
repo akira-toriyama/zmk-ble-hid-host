@@ -21,7 +21,21 @@
 
 ## ⚠️ 最新 (2026-06-18 PM) — 再接続バグ修正 ＋ M4 実現可能性 確定
 
-### 🐛 再接続バグ修正（config のみ・ブランチ `fix/reconnect-directed-adv`, commit `ffab7d7`+`9a37d0d`）— **実機 P-C' 進行中: ①②③ 全部 修正、③は再焼き待ち**
+### 🐛 再接続バグ修正 — **元の「毎回 再ペアリング」問題は ✅完全解決＋main マージ済み（PR #2）**。残り = 別の freeze（調査中・別doc）
+
+**✅ 解決済み（main, PR #2）= ユーザ報告の本丸**: ①ボンド永続（`CONFIG_SETTINGS` chain）②directed-advert 再接続
+（`BT_SCAN_WITH_IDENTITY`）③再接続後 discovery -ENOMEM（`BT_GATT_AUTO_RESUBSCRIBE=n`＋TX buf=8）。実機 P-C' で
+**抜き差し／マウス電源OFF→ON とも 再ペア無しで自動再接続**を確認（`secured (level 2)`＝ボンド再利用）。マウスは常用可能。
+
+**⚠️ 残存 freeze（OPEN・別セッションで調査）**: 「**マウス電源ON直後に即・激しく動かす**と一瞬動いて固まる」。RX バッファ修正
+（`BT_CTLR_RX_BUFFERS=6`/`BT_BUF_ACL_RX_COUNT_EXTRA=6`＋conn param `6,12,0,500`, ブランチ `fix/reconnect-rx-buffer-wedge`
+commit `ef1e623`）で **永久ハング→自動復帰**まで改善したが、激しい連続操作だと ~6-13秒ごとに supervision timeout(0x08)が残る。
+**完全な引き継ぎ＝[`docs/investigation-reconnect-freeze.md`](docs/investigation-reconnect-freeze.md)**（症状/repro/試して除外した事
+/根本原因(Nordic LLL の RX ACK 枯渇)/未検証の有力仮説(system workqueue が BT RX thread を starve→report_work を専用低prio
+workqueue へ)/診断の罠(**verbose BT DBG ログは BLE timing を壊しペアリング不能になる＝使うな**)/実機ログ保存先
+`.zmk-blehh-build/freeze-logs/`）。**この `fix/reconnect-rx-buffer-wedge` ブランチを main に取り込むかは判断保留**（部分改善ではある）。
+
+（以下は ① の最初の修正の経緯。詳細は上記 investigation doc に集約済み）
 
 ユーザ報告: **マウス電源 OFF→ON、または ドングルを USB から抜き差しすると 毎回 再ペアリングが必要**。
 受信器 shield `.conf` の **2つの設定欠落**が原因（症状ごとに1つずつ）。実ビルドの `.config` で裏取り済:
