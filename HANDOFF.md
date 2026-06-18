@@ -21,7 +21,7 @@
 
 ## ⚠️ 最新 (2026-06-18 PM) — 再接続バグ修正 ＋ M4 実現可能性 確定
 
-### 🐛 再接続バグ修正（config のみ・ブランチ `fix/reconnect-directed-adv` commit `ffab7d7`）— **実機検証待ち P-C'**
+### 🐛 再接続バグ修正（config のみ・ブランチ `fix/reconnect-directed-adv`, commit `ffab7d7`+`9a37d0d`）— **実機 P-C' 進行中: ①②③ 全部 修正、③は再焼き待ち**
 
 ユーザ報告: **マウス電源 OFF→ON、または ドングルを USB から抜き差しすると 毎回 再ペアリングが必要**。
 受信器 shield `.conf` の **2つの設定欠落**が原因（症状ごとに1つずつ）。実ビルドの `.config` で裏取り済:
@@ -38,9 +38,31 @@
    `!BT_PRIVACY` 前提＝満たす）。Zephyr Kconfig help に「directed advertise reports for the local identity を受けたいなら有効化」と明記。
    `device_found` は既に `ADV_DIRECT_IND` を受理する（追加コード不要）。
 
-**ビルド検証**: default + logging 両 `.uf2` が Docker で green。両 `.config` で `CONFIG_SETTINGS=y` /
-`CONFIG_BT_SETTINGS=y` / `CONFIG_BT_SCAN_WITH_IDENTITY=y` 解決を確認。**コード変更なし（.conf のみ）＝M2/M3 のロジックは無傷**。
-logging `.uf2` = `/Volumes/workspace/.zmk-blehh-build/build-log/zephyr/zmk.uf2`（491520B）。
+3. **再接続後にカーソルが凍る（②修正で再接続するようになって初めて露見した別バグ・commit `9a37d0d`）**: 実機 P-C' で
+   マウス電源OFF→ONすると **再接続＋ボンド再利用は成功**するのに（ログ `secured (level 2)`＝再ペア無し）、直後に
+   `bt_gatt: resub failed (err -12)`×2 → `HIDS discover failed (-12)`（**-12 = -ENOMEM**）で **GATT discovery が失敗→
+   HID 再 subscribe されず→カーソル凍結**。原因2つ: (a) `CONFIG_BT_GATT_AUTO_RESUBSCRIBE`（Zephyr 既定 y）が**前接続の
+   params を自動 resubscribe** しようとし、こちらが `security_changed` から走らせる**自前の再 discovery と競合**＋わずかな
+   ATT/L2CAP バッファを食い合って両方 -ENOMEM。→ `=n`（こちらは手動で毎回 fresh に再 discovery+subscribe。clean disconnect で
+   旧 sub は `notify_cb(NULL)` により撤去される）。(b) TX バッファが全部 3 で、discover + 5本連続 CCC write には足りない
+   （P-B' の "Not enough buffer space" の正体）。→ `BT_L2CAP_TX_BUF_COUNT`/`BT_ATT_TX_COUNT`/`BT_BUF_ACL_TX_COUNT`/
+   `BT_CONN_TX_MAX` を 8 に増量。
+
+**ビルド検証**: default + logging 両 `.uf2` が Docker で green。`.config` で `CONFIG_SETTINGS=y` / `CONFIG_BT_SETTINGS=y` /
+`CONFIG_BT_SCAN_WITH_IDENTITY=y` / `CONFIG_BT_GATT_AUTO_RESUBSCRIBE=n` / 4 つの TX count=8 を解決確認。**コード変更なし（.conf のみ）
+＝M2/M3 のロジックは無傷**。logging `.uf2` = `/Volumes/workspace/.zmk-blehh-build/build-log/zephyr/zmk.uf2`（491008B）。
+
+**実機 P-C'（2026-06-18 PM, ライブログで実証）**:
+- ✅ **① ボンド永続**: ドングルを USB 抜き差し（XIAO 再起動）→ **再ペア無しで自動再接続**（flash 保存 OK）。
+- ✅ **② マウス電源OFF→ON で再接続＋ボンド再利用**: ログに `disconnected (reason 0x08)` → `scanning...` →
+  `target CD:CF:BF:79:68:00 — connecting` → `connected` → **`secured (level 2)`（=再ペア無し）**。
+  **このマウスは static random アドレス（RPA でない・上位2bit=11）**＝アドレス不変なので `addr_is_bonded` で素直に match。
+- ❌→🔧 **③ 再接続後 discovery -ENOMEM でカーソル凍結** → commit `9a37d0d` で修正、**再焼き＆再テスト待ち**。
+- **ログ採取の罠**: 焼くと CDC ポート名が変わる（live=`21101`, ghost=`21201` が boot banner 46B だけ）。`cat` は**両ポート明示で
+  並行採取して live を特定**（zsh は `for p in $PORTS` で語分割しない→ポート名はベタ書き）。`screen` v4 は `-Logfile` 非対応・
+  `-c rc(logfile …)`。background `cat` の `cp` は "Permission denied" → **foreground cp なら通る**。
+- **次の一手**: `build-log/zephyr/zmk.uf2`(491008B) を焼き、マウス電源OFF→ON で `secured` 後に `report map parsed`→
+  `subscribed`→`report h=` が出てカーソルが復活すれば ③ 解消＝**再接続バグ完全解決→main 取込**。
 **残り = P-C' 実機検証（👤 ユーザ・§6）**: ① 新ファームを焼いて **一度だけ通常ペアリング**（旧ファームは未保存なので新規ボンド扱い）→
 ② マウス電源 OFF→ON で自動再接続するか、③ ドングル抜き差しで自動再接続するか。再ペア不要になれば修正完了 → main 取込。
 
