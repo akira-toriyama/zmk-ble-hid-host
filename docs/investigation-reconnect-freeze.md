@@ -302,3 +302,38 @@ lower on-air error rate, or accepting the hardware ceiling).
 Full design + adversarial verdicts: workflow run `wf_f0d8d56f-4b4`, output saved at
 `/private/tmp/.../tasks/wyy6pfz9h.output` (FIX-A `le_param_req` body, FIX-B hook,
 validity math, three-way OBSERVE interpretation guide).
+
+## 12. SEPARATE OPEN BUG — "idle ~1 hour → dead, only a dongle re-plug revives" (reported 2026-06-18)
+
+User-reported, distinct from the move-immediately freeze above (that one is a
+sustained-FLOOD failure; this one is an IDLE/long-duration failure):
+- Leave it idle ~1 hour → the cursor stops working entirely.
+- A power-cycle of the MOUSE does NOT fix it; only **unplugging/replugging the
+  XIAO dongle** (a full dongle reboot) revives it.
+
+That "only a dongle reboot fixes it" signature points at the DONGLE side getting
+wedged, not the mouse. Hypotheses to investigate (no device needed first; then
+confirm on-device with the logging build):
+1. **Mouse auto-sleep → disconnect → dongle reconnect path wedges.** Most BLE mice
+   sleep after a few minutes idle and drop the link. The dongle should re-scan and
+   reconnect when the mouse wakes (the directed-adv / `BT_SCAN_WITH_IDENTITY`
+   path). If, after an idle disconnect, the dongle's scan stops or never restarts
+   (or leaks a conn/scan resource over repeated sleep/wake cycles across an hour),
+   it would go permanently dead until rebooted. Check `disconnected()` →
+   `start_scan()` always re-arms, and that nothing accumulates over many
+   sleep/wake cycles.
+2. **USB suspend not resumed.** If the host PC USB-suspends the dongle during idle
+   and ZMK's USB HID does not resume cleanly, output would die until re-enumeration
+   (a re-plug). Check the `usb_hid: Device suspended/resumed` handling (these lines
+   appear at boot in the logs).
+3. **Scan/connection resource leak** across repeated mouse sleep/wake over an hour
+   (conn refs, scan restart errors). Watch for an accumulating error in a long
+   idle capture.
+4. Less likely: a timer/counter effect at ~1 h.
+
+How to capture: flash the logging combined build, leave it idle (mouse on a
+desk, no motion) for ~1 h with the serial capture running, and read what the
+dongle logs at the moment it dies (a disconnect with no following reconnect? a
+scan error? USB suspend with no resume?). The `report queue full` / motion lines
+are irrelevant here; the connect/disconnect/scanning INF lines are the signal.
+**Owner asked to tackle this AFTER the move-freeze root-cause hunt.**
