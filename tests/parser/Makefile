@@ -7,14 +7,15 @@
 # drivers/input/hid_report_*.c) has no Zephyr dependencies.
 
 REPO_INCLUDE := $(abspath ../../include)
+FIXTURES_DIR := $(abspath fixtures)
 
 CC     ?= cc
-CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I$(REPO_INCLUDE)
+CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I$(REPO_INCLUDE) -DFIXTURES_DIR='"$(FIXTURES_DIR)"'
 
-# M2 appends the implementations once they exist:
-#   SRCS += ../../drivers/input/hid_report_parser.c
-#   SRCS += ../../drivers/input/hid_report_decode.c
+# M2 pure decode core (no Zephyr deps -- builds with a plain C compiler).
 SRCS := test_runner.c
+SRCS += ../../drivers/input/hid_report_parser.c
+SRCS += ../../drivers/input/hid_report_decode.c
 
 .PHONY: test clean
 test: test_runner

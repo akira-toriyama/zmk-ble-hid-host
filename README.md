@@ -9,11 +9,14 @@ subsystem — so the movement/buttons can be remapped by ZMK's standard
 In one line: **the receive half of an HID-Remapper, built as a ZMK module —
 remapping and output are left entirely to ZMK core.**
 
-> **Status: work in progress.** The module skeleton, the pure decode contract,
-> and host-side tests are in place and green. The BLE HOGP central and the
-> report decoder are not implemented yet, and nothing has been validated on
-> real hardware. See **[Project status](#project-status)** and
-> [`HANDOFF.md`](./HANDOFF.md) for exactly what is and isn't done.
+> **Status: work in progress.** BLE HOGP receive is **proven on real hardware**
+> (a diagnostic probe bonds to the IST PRO and streams its reports — see
+> `HANDOFF.md` §M1), and the **report-map parser + decoder are implemented and
+> host-tested** against the real captured Report Map and reports. Still to do:
+> port the HOGP central into the module, a module firmware-build CI, and
+> publishing decoded events into ZMK (so the cursor actually moves). See
+> **[Project status](#project-status)** and [`HANDOFF.md`](./HANDOFF.md) for
+> exactly what is and isn't done.
 
 Primary use case: a Seeed XIAO nRF52840 dongle bridging an **Elecom IST PRO**
 trackball (BLE) to a PC over USB.
@@ -64,9 +67,9 @@ zmk-ble-hid-host/
 ├── CMakeLists.txt / Kconfig                # module roots
 ├── drivers/input/
 │   ├── ble_hid_host.c                      # virtual input device  [M0 ✓]
-│   ├── hog_central.c                       # scan/connect/discover/subscribe  [M1]
-│   ├── hid_report_parser.c                 # Report Map → field layout  [M2]
-│   └── hid_report_decode.c                 # raw report → {dx,dy,buttons,wheel}  [M2]
+│   ├── hid_report_parser.c                 # Report Map → field layout  [M2 ✓]
+│   ├── hid_report_decode.c                 # raw report → {dx,dy,buttons,wheel}  [M2 ✓]
+│   └── hog_central.c                       # scan/connect/discover/subscribe  [M2 — next]
 ├── include/zmk_ble_hid_host/
 │   └── hid_report_parser.h                 # pure, Zephyr-free decode contract  [M0 ✓]
 ├── dts/bindings/input/zmk,ble-hid-host.yaml
@@ -82,13 +85,15 @@ Experiment-driven milestones (from the project brief):
 
 - [x] **M0 — scaffold + CI base.** Module skeleton, DTS binding, virtual input
   device registration, pure decode contract, host-test harness, host-test CI.
-- [ ] **M1 — receive (the hardest gate).** Scan → connect to the IST PRO →
-  GATT discovery (HID 0x1812 → Report 0x2A4D / Report Map 0x2A4B / Protocol
-  Mode 0x2A4E) → subscribe → log raw report bytes. Central+peripheral
-  coexistence, bonding/reconnect, 7.5 ms connection-interval request.
-- [ ] **M2 — decode.** Report-Map-driven parser + decoder (pure, host-tested).
+- [x] **M1 — receive (the hardest gate).** ✅ Proven on real hardware via the
+  `probe/` diagnostic: scan → connect to the IST PRO → bond (legacy Just Works /
+  NoInputNoOutput) → GATT discovery → subscribe → 5000+ raw reports received,
+  7.5 ms connection interval accepted. (The probe ports into the module next.)
+- [~] **M2 — decode.** ✅ Report-Map-driven parser + decoder implemented and
+  host-tested against the real IST PRO Report Map and captured reports. **Left:**
+  port the HOGP central into the module (`hog_central.c`) + a module firmware-build CI.
 - [ ] **M3 — input device.** Decoded values → `input_report_rel/key` with
-  button edge tracking.
+  button edge tracking (this is when the cursor actually moves).
 - [ ] **M4 — wiring.** `input-listener` + `input-processors` in your zmk-config.
 - [ ] **M5 — dongle.** Case, daily use.
 
@@ -161,7 +166,7 @@ This runs in CI on every push (`.github/workflows/hosttest.yml`).
 
 **Firmware build** — done from your `zmk-config` via ZMK's normal GitHub
 Actions build (or a local `west build -b seeeduino_xiao_ble`). A dedicated
-firmware-build CI for this repo is planned for M1 (see `HANDOFF.md`).
+firmware-build CI for this repo is the next milestone (see `HANDOFF.md` §4).
 
 <details>
 <summary><b>Design notes</b></summary>
