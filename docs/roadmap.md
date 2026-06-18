@@ -141,6 +141,101 @@ Notes / gotchas:
   community module `badjeff/zmk-input-behavior-listener` is **not** needed —
   the feature was upstreamed.
 
+### Buttons beyond 5 (button 6/7/8 → key **or layer**)
+
+**Finding (measured on the Elecom IST PRO, 2026-06):** the "config-only" path
+above covers only the **first 5 buttons**. There are two independent 5-button
+ceilings:
+
+1. **This module** only publishes 5: `BLE_HID_HOST_PUBLISH_BTNS` in
+   [`drivers/input/ble_hid_host.c`](../drivers/input/ble_hid_host.c) bounds the
+   publish loop (and the disconnect-release loop). With the default 5, buttons 6+
+   are **decoded** (the log shows them) but never emitted as input events, so no
+   input-processor can see them. **Raised to 8** so buttons 6..8 reach ZMK as
+   `INPUT_BTN_5/6/7`.
+2. **ZMK's mouse HID** itself caps at 5: `ZMK_HID_MOUSE_NUM_BUTTONS = 0x05`
+   (`app/include/zmk/hid.h`), descriptor `USAGE_MAX8(5)`,
+   `zmk_hid_mouse_button_press()` rejects `button >= 5`.
+
+Measured Elecom IST PRO map (set bit `i` in `buttons=0x....` → `INPUT_BTN_<i>`):
+
+| log | bit | code | in default 5? |
+|---|---|---|---|
+| 0x0001 | 0 | INPUT_BTN_0 (left) | ✅ |
+| 0x0002 | 1 | INPUT_BTN_1 | ✅ |
+| 0x0008 | 3 | INPUT_BTN_3 | ✅ |
+| 0x0010 | 4 | INPUT_BTN_4 | ✅ |
+| 0x0020 | 5 | INPUT_BTN_5 | ❌ → now published |
+| 0x0040 | 6 | INPUT_BTN_6 | ❌ → now published |
+| 0x0080 | 7 | INPUT_BTN_7 | ❌ → now published |
+
+Once emitted, ZMK needs **no** change for key/layer remap: the stock
+`input-processor-behaviors` matches `INPUT_BTN_5/6/7` and fires any behavior —
+`&kp`, `&mo`, `&tog`, `&to` all work (it forwards the press/release edge, so a
+momentary layer is held exactly while the button is held). ZMK's own 5-button cap
+(#2) is irrelevant here: the processor consumes the event (`ZMK_INPUT_PROC_STOP`)
+before the mouse-HID path. The cap only bites if you want buttons 6+ as *real
+extra mouse buttons* — that needs an upstream ZMK change
+(`ZMK_HID_MOUSE_NUM_BUTTONS` + descriptor), an out-of-tree patch / PR candidate.
+
+`&lt`/`&mt` (hold-tap) may need on-device verification — timing-based behaviors
+through an input processor have edge cases; `&mo`/`&tog`/`&to`/`&kp` are clean.
+
+### Wheel / HWheel direction → key (or layer) — *planned*
+
+**Why this is different from buttons.** A button has a unique code per button
+(`INPUT_BTN_0/1/2…`), so once emitted the stock `input-processor-behaviors`
+catches it by code. The wheel is an **axis**: left/right (and up/down) share one
+code and differ only by **sign** — horizontal tilt is `INPUT_REL_HWHEEL` value
+`-1` (left) / `+1` (right); vertical is `INPUT_REL_WHEEL` `+1` (up) / `-1`
+(down). ZMK's stock processors match on **code only**, so they cannot split a
+direction by sign. The split must happen where the sign is visible = **this
+module**.
+
+**Approach (settled, not yet implemented).** In `ble_hid_host_publish`, convert
+each wheel tick into a **tap** (press+release) of a distinct, ZMK-mouse-ignored
+key code, then remap it downstream exactly like a button. Wheel ticks arrive as
+discrete `±1` (no held state), so tap-per-tick is the model — continuous
+tilt/scroll = repeated taps (auto-repeat feel). Hold semantics are **not**
+possible and not attempted.
+
+Code mapping (DPAD codes — semantically tidy, collision-free with `INPUT_BTN_0..9`
+used by physical buttons; all standard Zephyr codes in `input-event-codes.h`, no
+new defines):
+
+| wheel motion | synthetic code |
+|---|---|
+| HWheel left  | `INPUT_BTN_DPAD_LEFT`  |
+| HWheel right | `INPUT_BTN_DPAD_RIGHT` |
+| Wheel up     | `INPUT_BTN_DPAD_UP`    |
+| Wheel down   | `INPUT_BTN_DPAD_DOWN`  |
+
+**Module changes (`drivers/input/`):**
+
+1. A `tap_btn(dev, code)` helper = `input_report_key(code,1,false)` then
+   `(code,0,false)`.
+2. Gate the hwheel/wheel emit on two Kconfigs (default **n**, so existing scroll
+   behavior is unchanged and the module stays generic):
+   `CONFIG_ZMK_BLE_HID_HOST_HWHEEL_AS_KEYS` (→ DPAD_LEFT/RIGHT) and
+   `CONFIG_ZMK_BLE_HID_HOST_WHEEL_AS_KEYS` (→ DPAD_UP/DOWN).
+3. **Gotcha — keep the sync terminator.** DPAD taps are consumed by the behaviors
+   processor (`ZMK_INPUT_PROC_STOP`) *before* the listener's flush, so they
+   cannot carry the report's sync. Always end the report with a `sync=true`
+   `INPUT_REL_WHEEL` (value `0` when the vertical wheel is used as keys, so it
+   flushes dx/dy/buttons without scrolling).
+
+**Config side (zmk-config):** `.conf` enables the Kconfig(s); keymap adds the
+DPAD codes to a `zmk,input-processor-behaviors` (can share the BTN_5+ node):
+
+```dts
+codes    = <INPUT_BTN_DPAD_LEFT INPUT_BTN_DPAD_RIGHT INPUT_BTN_DPAD_UP INPUT_BTN_DPAD_DOWN>;
+bindings = <&kp LEFT            &kp RIGHT            &kp UP            &kp DOWN>;
+```
+
+**Tradeoff:** converting an axis to keys **removes that axis's normal scroll**
+(the same signal is repurposed). The two Kconfigs are independent, so you can
+key-ify horizontal while keeping vertical scroll.
+
 ### Axis tuning (free, stock processors)
 
 Invert / swap axes, scale, snipe (slow), and scroll are all stock
