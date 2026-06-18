@@ -1,0 +1,685 @@
+/*
+ * Copyright (c) 2026 akira-toriyama
+ * SPDX-License-Identifier: MIT
+ *
+ * HOGP BLE-central engine for zmk-ble-hid-host.
+ *
+ * Ported from the M1 receive probe (probe/src/main.c, proven on an ELECOM
+ * IST PRO): scan -> connect -> LE-legacy Just Works bond -> GATT discovery ->
+ * subscribe to the HID input reports. Added on top of the probe:
+ *   - reads + parses the peer's HID Report Map (0x2A4B) at runtime so any HOGP
+ *     pointer can be decoded (zmk_hid_parse_report_map);
+ *   - defers each notification out of the BT RX context (k_msgq + k_work) and
+ *     decodes it there (zmk_hid_decode_report).
+ *
+ * This module owns the Bluetooth stack: CONFIG_ZMK_BLE is off (the dongle
+ * outputs over USB), so ZMK core does not bt_enable()/settings_load() -- we do.
+ *
+ * Milestone status: M2 logs each decoded report. M3 will publish it on the
+ * input device (see the marked call site in report_work_handler) and add
+ * Report Reference (0x2908) report-ID matching so only the pointer report is
+ * turned into motion.
+ */
+
+#include "hog_central.h"
+
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_DECLARE(ble_hid_host, CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL);
+
+#if IS_ENABLED(CONFIG_BT_CENTRAL)
+
+#include <string.h>
+
+#include <zephyr/kernel.h>
+#include <zephyr/settings/settings.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/hci.h>
+
+#include <zmk_ble_hid_host/hid_report_parser.h>
+
+#define MAX_REPORTS 12
+#define APPEARANCE_MOUSE 0x03C2
+#define FAIL_COOLDOWN_MS 8000
+#define REPORT_MAP_MAX 512
+
+/* The publish target (M3) and the optional GAP-name filter from devicetree. */
+static const struct device *host_dev;
+static const char *name_filter;
+
+static struct bt_conn *default_conn;
+
+/* Discovery is sequential, so one shared params struct is fine. */
+static struct bt_gatt_discover_params discover_params;
+static struct bt_uuid_16 disc_uuid = BT_UUID_INIT_16(0);
+
+enum disc_state { DISC_IDLE, DISC_HIDS_PRIMARY, DISC_REPORT_MAP_CHRC, DISC_REPORT_CHRC, DISC_CCC };
+static enum disc_state disc_state;
+
+static uint16_t hids_end_handle;
+
+/* HID Report Map (0x2A4B): read into rm_buf, then parsed into `layout`.
+ *
+ * `layout`/`layout_valid` are written on the BT RX workqueue (one-shot at
+ * discovery, before any notification flows) and read on the system workqueue
+ * (report_work_handler). On single-core M4 a torn read can at worst dirty one
+ * M2 log line. Before M3 publishes motion, publish the layout atomically (or
+ * double-buffer) so injected deltas can never come from a half-written layout. */
+static struct bt_gatt_read_params rm_read_params;
+static uint8_t rm_buf[REPORT_MAP_MAX];
+static uint16_t rm_len;
+static struct zmk_hid_report_layout layout;
+static bool layout_valid;
+
+/* Report value handles found in the CHARACTERISTIC pass, awaiting CCC wiring. */
+static uint16_t pending_reports[MAX_REPORTS];
+static size_t pending_count;
+static size_t pending_idx;
+
+/* Each subscription needs its OWN long-lived params (never one shared global). */
+static struct bt_gatt_subscribe_params sub_params[MAX_REPORTS];
+static size_t sub_count;
+
+/* Cooldown: skip a peer that just failed pairing so the scanner cycles on. */
+static bt_addr_le_t last_failed_addr;
+static uint32_t last_failed_ms;
+
+/* Parsed advertising/scan-response fields for one report. */
+struct ad_info {
+	bool match;    /* looks like a HOGP pointer we should connect to */
+	bool has_hids; /* advertised the HID service (0x1812) */
+	uint16_t appearance;
+	char name[32];
+};
+
+static void start_scan(void);
+static void subscribe_pending(struct bt_conn *conn);
+static void start_report_discovery(struct bt_conn *conn);
+
+/* ─────────────── notify -> defer -> decode (k_msgq + k_work) ─────────────── */
+struct report_evt {
+	uint16_t value_handle;
+	uint8_t len;
+	uint8_t data[32];
+};
+
+K_MSGQ_DEFINE(report_msgq, sizeof(struct report_evt), 16, 4);
+static struct k_work report_work;
+
+static void report_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	struct report_evt evt;
+
+	while (k_msgq_get(&report_msgq, &evt, K_NO_WAIT) == 0) {
+		struct zmk_hid_pointer_report report;
+
+		if (!layout_valid) {
+			LOG_HEXDUMP_DBG(evt.data, evt.len, "report (no layout yet)");
+			continue;
+		}
+
+		/* M3 TODO: only decode the characteristic whose Report Reference
+		 * (0x2908) report-ID equals layout.report_id, else non-pointer
+		 * reports (keyboard/consumer) would be injected as motion. For the
+		 * M2 log we decode every report; zmk_hid_decode_report rejects ones
+		 * shorter than the layout needs, and value_handle tags the source. */
+		if (zmk_hid_decode_report(&layout, evt.data, evt.len, &report) == 0) {
+			LOG_INF("report h=%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%04x",
+				evt.value_handle, report.dx, report.dy, report.wheel,
+				report.hwheel, (unsigned)report.buttons);
+			/* M3: ble_hid_host_publish(host_dev, &report); */
+		}
+	}
+}
+
+static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
+			 const void *data, uint16_t length)
+{
+	ARG_UNUSED(conn);
+
+	if (!data) {
+		params->value_handle = 0U; /* subscription torn down */
+		return BT_GATT_ITER_STOP;
+	}
+
+	struct report_evt evt;
+
+	evt.value_handle = params->value_handle;
+	evt.len = MIN(length, sizeof(evt.data));
+	memcpy(evt.data, data, evt.len);
+
+	/* BT RX context: hand off, never decode/publish inline. Drop on overflow. */
+	if (k_msgq_put(&report_msgq, &evt, K_NO_WAIT) == 0) {
+		k_work_submit(&report_work);
+	} else {
+		LOG_WRN("report queue full; dropping");
+	}
+	return BT_GATT_ITER_CONTINUE;
+}
+
+/* ─────────────── Report Map (0x2A4B): read long, then parse ──────────────── */
+static uint8_t report_map_read_cb(struct bt_conn *conn, uint8_t err,
+				  struct bt_gatt_read_params *params, const void *data,
+				  uint16_t length)
+{
+	ARG_UNUSED(params);
+
+	if (err) {
+		LOG_ERR("report map read failed (0x%02x)", err);
+		start_report_discovery(conn); /* fall back to boot/length-gated decode */
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (data && length) {
+		uint16_t room = (uint16_t)(sizeof(rm_buf) - rm_len);
+		uint16_t n = MIN(length, room);
+
+		if (n < length) {
+			/* The Zephyr stack drives single.offset and stops on the short
+			 * PDU; we just stop accumulating. Warn so an oversized descriptor
+			 * doesn't fail to decode silently. (IST PRO's map is well under.) */
+			LOG_WRN("report map exceeds %u B; truncating", (unsigned)sizeof(rm_buf));
+		}
+		memcpy(rm_buf + rm_len, data, n);
+		rm_len += n;
+		return BT_GATT_ITER_CONTINUE; /* keep reading the long value */
+	}
+
+	/* data == NULL: read complete. */
+	if (zmk_hid_parse_report_map(rm_buf, rm_len, &layout) == 0 && layout.valid) {
+		layout_valid = true;
+		LOG_INF("report map parsed (%u B): report_id=%u buttons=%u", rm_len,
+			layout.report_id, layout.button_count);
+	} else {
+		LOG_WRN("report map parse found no pointer layout (%u B)", rm_len);
+	}
+
+	start_report_discovery(conn);
+	return BT_GATT_ITER_STOP;
+}
+
+static void read_report_map(struct bt_conn *conn, uint16_t value_handle)
+{
+	int err;
+
+	rm_len = 0;
+	memset(&rm_read_params, 0, sizeof(rm_read_params));
+	rm_read_params.func = report_map_read_cb;
+	rm_read_params.handle_count = 1;
+	rm_read_params.single.handle = value_handle;
+	rm_read_params.single.offset = 0;
+
+	err = bt_gatt_read(conn, &rm_read_params);
+	if (err) {
+		LOG_ERR("report map read start failed (%d)", err);
+		start_report_discovery(conn);
+	}
+}
+
+/* ───────────────────────── GATT discovery state machine ────────────────── */
+static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			     struct bt_gatt_discover_params *params)
+{
+	ARG_UNUSED(params);
+	int err;
+
+	if (!attr) {
+		/* The current discovery pass finished. */
+		if (disc_state == DISC_REPORT_MAP_CHRC) {
+			/* No Report Map characteristic; proceed without a layout. */
+			LOG_WRN("no HID Report Map (0x2A4B) found");
+			start_report_discovery(conn);
+		} else if (disc_state == DISC_REPORT_CHRC) {
+			if (pending_count == 0) {
+				LOG_WRN("no notifiable HID report characteristics found");
+				disc_state = DISC_IDLE;
+				return BT_GATT_ITER_STOP;
+			}
+			pending_idx = 0;
+			subscribe_pending(conn); /* start CCC discovery for report 0 */
+		}
+		return BT_GATT_ITER_STOP;
+	}
+
+	switch (disc_state) {
+	case DISC_HIDS_PRIMARY: {
+		const struct bt_gatt_service_val *svc = attr->user_data;
+
+		hids_end_handle = svc->end_handle;
+		LOG_INF("HID service: handles %u..%u", attr->handle, svc->end_handle);
+
+		/* First read the Report Map characteristic (0x2A4B). */
+		memcpy(&disc_uuid, BT_UUID_HIDS_REPORT_MAP, sizeof(disc_uuid));
+		discover_params.uuid = &disc_uuid.uuid;
+		discover_params.start_handle = attr->handle + 1;
+		discover_params.end_handle = hids_end_handle;
+		discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+		disc_state = DISC_REPORT_MAP_CHRC;
+
+		err = bt_gatt_discover(conn, &discover_params);
+		if (err) {
+			LOG_ERR("report-map discover failed (%d)", err);
+			disc_state = DISC_IDLE; /* no callback pending; don't wedge */
+		}
+		return BT_GATT_ITER_STOP;
+	}
+
+	case DISC_REPORT_MAP_CHRC: {
+		const struct bt_gatt_chrc *chrc = attr->user_data;
+
+		LOG_INF("report map chrc (value handle %u)", chrc->value_handle);
+		read_report_map(conn, chrc->value_handle); /* async; resumes discovery */
+		return BT_GATT_ITER_STOP;
+	}
+
+	case DISC_REPORT_CHRC: {
+		const struct bt_gatt_chrc *chrc = attr->user_data;
+
+		/* Only Input reports notify; Output/Feature share 0x2A4D but lack NOTIFY. */
+		if (chrc->properties & BT_GATT_CHRC_NOTIFY) {
+			if (pending_count < MAX_REPORTS) {
+				pending_reports[pending_count++] = chrc->value_handle;
+				LOG_INF("notifiable report chrc (value handle %u)",
+					chrc->value_handle);
+			} else {
+				LOG_WRN("> %d reports; ignoring extras", MAX_REPORTS);
+			}
+		}
+		return BT_GATT_ITER_CONTINUE; /* collect them all */
+	}
+
+	case DISC_CCC: {
+		/* attr is the CCC (0x2902) for pending_reports[pending_idx]. */
+		if (sub_count < MAX_REPORTS) {
+			struct bt_gatt_subscribe_params *sp = &sub_params[sub_count];
+
+			sp->notify = notify_cb;
+			sp->value = BT_GATT_CCC_NOTIFY;
+			sp->value_handle = pending_reports[pending_idx];
+			sp->ccc_handle = attr->handle;
+			sp->min_security = BT_SECURITY_L2;
+
+			err = bt_gatt_subscribe(conn, sp);
+			if (err && err != -EALREADY) {
+				LOG_ERR("subscribe failed (%d) value=%u", err, sp->value_handle);
+			} else {
+				LOG_INF("subscribed report value=%u ccc=%u", sp->value_handle,
+					sp->ccc_handle);
+				sub_count++;
+			}
+		}
+		pending_idx++;
+		subscribe_pending(conn); /* next report, or finish */
+		return BT_GATT_ITER_STOP;
+	}
+
+	default:
+		return BT_GATT_ITER_STOP;
+	}
+}
+
+/* Discover the CCC for pending_reports[pending_idx]; if exhausted, we're done. */
+static void subscribe_pending(struct bt_conn *conn)
+{
+	int err;
+
+	if (pending_idx >= pending_count) {
+		disc_state = DISC_IDLE;
+		LOG_INF("discovery done: subscribed to %u report(s)", sub_count);
+		return;
+	}
+
+	memcpy(&disc_uuid, BT_UUID_GATT_CCC, sizeof(disc_uuid)); /* 0x2902, NOT 0x2908 */
+	discover_params.uuid = &disc_uuid.uuid;
+	discover_params.start_handle = pending_reports[pending_idx] + 1;
+	discover_params.end_handle = hids_end_handle;
+	discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
+	disc_state = DISC_CCC;
+
+	err = bt_gatt_discover(conn, &discover_params);
+	if (err) {
+		LOG_ERR("CCC discover failed (%d)", err);
+		disc_state = DISC_IDLE;
+	}
+}
+
+/* Discover the notifiable Report characteristics (0x2A4D). */
+static void start_report_discovery(struct bt_conn *conn)
+{
+	int err;
+
+	pending_count = 0;
+	pending_idx = 0;
+	sub_count = 0;
+
+	memcpy(&disc_uuid, BT_UUID_HIDS_REPORT, sizeof(disc_uuid)); /* 0x2A4D */
+	discover_params.uuid = &disc_uuid.uuid;
+	discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	discover_params.end_handle = hids_end_handle;
+	discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+	disc_state = DISC_REPORT_CHRC;
+
+	err = bt_gatt_discover(conn, &discover_params);
+	if (err) {
+		LOG_ERR("report-chrc discover failed (%d)", err);
+		disc_state = DISC_IDLE;
+	}
+}
+
+static void start_discovery(struct bt_conn *conn)
+{
+	int err;
+
+	layout_valid = false;
+	hids_end_handle = 0;
+
+	memcpy(&disc_uuid, BT_UUID_HIDS, sizeof(disc_uuid)); /* 0x1812 */
+	memset(&discover_params, 0, sizeof(discover_params));
+	discover_params.uuid = &disc_uuid.uuid;
+	discover_params.func = discover_func;
+	discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+	discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+	disc_state = DISC_HIDS_PRIMARY;
+
+	err = bt_gatt_discover(conn, &discover_params);
+	if (err) {
+		LOG_ERR("HIDS discover failed (%d)", err);
+	}
+}
+
+/* ───────────────────────── target selection ────────────────────────────── */
+struct bond_match {
+	const bt_addr_le_t *addr;
+	bool found;
+};
+
+static void bond_match_cb(const struct bt_bond_info *info, void *user_data)
+{
+	struct bond_match *bf = user_data;
+
+	if (bt_addr_le_cmp(&info->addr, bf->addr) == 0) {
+		bf->found = true;
+	}
+}
+
+static bool addr_is_bonded(const bt_addr_le_t *addr)
+{
+	struct bond_match bf = {.addr = addr, .found = false};
+
+	bt_foreach_bond(BT_ID_DEFAULT, bond_match_cb, &bf);
+	return bf.found;
+}
+
+static bool ad_parse_cb(struct bt_data *data, void *user_data)
+{
+	struct ad_info *ai = user_data;
+
+	switch (data->type) {
+	case BT_DATA_UUID16_SOME:
+	case BT_DATA_UUID16_ALL:
+		for (int i = 0; i + 1 < data->data_len; i += 2) {
+			if (sys_get_le16(&data->data[i]) == BT_UUID_HIDS_VAL) {
+				ai->has_hids = true;
+			}
+		}
+		break;
+	case BT_DATA_GAP_APPEARANCE:
+		if (data->data_len >= 2) {
+			ai->appearance = sys_get_le16(data->data);
+			if (ai->appearance == APPEARANCE_MOUSE) {
+				ai->match = true;
+			}
+		}
+		break;
+	case BT_DATA_NAME_SHORTENED:
+	case BT_DATA_NAME_COMPLETE: {
+		size_t n = MIN(data->data_len, sizeof(ai->name) - 1);
+
+		memcpy(ai->name, data->data, n);
+		ai->name[n] = '\0';
+		/* If a device-name filter is configured, match it exactly; otherwise
+		 * fall back to the IST/ELECOM heuristic (and mouse appearance above). */
+		if (name_filter) {
+			if (strcmp(ai->name, name_filter) == 0) {
+				ai->match = true;
+			}
+		} else if (strstr(ai->name, "IST") || strstr(ai->name, "ELECOM") ||
+			   strstr(ai->name, "ELE")) {
+			ai->match = true;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	return true; /* parse every field */
+}
+
+static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
+			 struct net_buf_simple *ad)
+{
+	char s[BT_ADDR_LE_STR_LEN];
+	struct ad_info ai = {0};
+	int err;
+
+	if (default_conn) {
+		return;
+	}
+	/* Only initiate to connectable advertising (skip scan responses). */
+	if (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
+	    type != BT_GAP_ADV_TYPE_EXT_ADV) {
+		return;
+	}
+
+	bt_addr_le_to_str(addr, s, sizeof(s));
+	bt_data_parse(ad, ad_parse_cb, &ai);
+
+	/* Connect to a bonded peer (reconnect) or anything that looks like a pointer. */
+	bool bonded = addr_is_bonded(addr);
+
+	if (!bonded && !ai.match) {
+		return;
+	}
+
+	/* Skip a device that just failed pairing so the scanner cycles to others. */
+	if (!bonded && bt_addr_le_cmp(addr, &last_failed_addr) == 0 &&
+	    (k_uptime_get_32() - last_failed_ms) < FAIL_COOLDOWN_MS) {
+		return;
+	}
+
+	LOG_INF("target %s (rssi %d) name '%s' — connecting", s, rssi, ai.name);
+
+	err = bt_le_scan_stop();
+	if (err) {
+		LOG_ERR("scan stop failed (%d)", err);
+		return;
+	}
+
+	/* Request 7.5ms (interval 6 x 1.25ms), latency 0, 4s timeout; peer may downgrade. */
+	struct bt_le_conn_param *cp = BT_LE_CONN_PARAM(6, 6, 0, 400);
+
+	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, cp, &default_conn);
+	if (err) {
+		LOG_ERR("create connection failed (%d)", err);
+		start_scan();
+	}
+}
+
+static void start_scan(void)
+{
+	struct bt_le_scan_param sp = {
+		.type = BT_LE_SCAN_TYPE_ACTIVE,
+		.options = BT_LE_SCAN_OPT_NONE,
+		.interval = BT_GAP_SCAN_FAST_INTERVAL,
+		.window = BT_GAP_SCAN_FAST_WINDOW,
+	};
+	int err = bt_le_scan_start(&sp, device_found);
+
+	if (err) {
+		LOG_ERR("scan start failed (%d)", err);
+		return;
+	}
+	LOG_INF("scanning for a HOGP pointer...");
+}
+
+/* ───────────────────────── connection callbacks ────────────────────────── */
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+	char s[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), s, sizeof(s));
+
+	if (err) {
+		LOG_ERR("failed to connect %s (0x%02x)", s, err);
+		bt_conn_unref(default_conn);
+		default_conn = NULL;
+		start_scan();
+		return;
+	}
+
+	LOG_INF("connected: %s", s);
+
+	/* Request L2 (encryption, unauthenticated) -- NOT L3. The IST PRO is
+	 * NoInputNoOutput / LE-legacy, so Just Works is the only viable method;
+	 * MITM (L3) is fatal. Legacy is permitted via BT_SMP_SC_PAIR_ONLY=n.
+	 * Discovery is encryption-gated, so it begins only in security_changed. */
+	err = bt_conn_set_security(conn, BT_SECURITY_L2);
+	if (err) {
+		LOG_ERR("set security failed (%d)", err);
+	}
+}
+
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+			     enum bt_security_err err)
+{
+	if (err != BT_SECURITY_ERR_SUCCESS || level < BT_SECURITY_L2) {
+		LOG_WRN("pairing/security failed (level %u err %d) — disconnecting", level, err);
+		bt_addr_le_copy(&last_failed_addr, bt_conn_get_dst(conn));
+		last_failed_ms = k_uptime_get_32();
+		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		return;
+	}
+	LOG_INF("secured (level %u) — starting GATT discovery", level);
+	start_discovery(conn);
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	char s[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), s, sizeof(s));
+	LOG_INF("disconnected: %s (reason 0x%02x)", s, reason);
+
+	if (default_conn != conn) {
+		return;
+	}
+	bt_conn_unref(default_conn);
+	default_conn = NULL;
+	sub_count = 0;
+	pending_count = 0;
+	pending_idx = 0;
+	disc_state = DISC_IDLE;
+	/* Invalidate the peer's layout the instant the link drops: reports still
+	 * queued (or arriving before the next peer's report map is parsed) must NOT
+	 * be decoded against a stale layout -- critical when reconnecting to a
+	 * DIFFERENT bonded peer (BT_MAX_PAIRED=2). */
+	layout_valid = false;
+	rm_len = 0;
+
+	start_scan(); /* auto-reconnect: re-scan, match the bonded peer, re-discover */
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+	.security_changed = security_changed,
+};
+
+/* ─────────────── pairing callbacks (NoInputNoOutput -> Just Works) ───────── */
+static void auth_cancel(struct bt_conn *conn)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("pairing cancelled");
+}
+
+/* Only .cancel set => NoInputNoOutput => Just Works. */
+static struct bt_conn_auth_cb auth_cb = {
+	.cancel = auth_cancel,
+};
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("paired (bonded=%d)", bonded);
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	ARG_UNUSED(conn);
+	LOG_WRN("pairing failed (reason %d)", reason);
+}
+
+static struct bt_conn_auth_info_cb auth_info_cb = {
+	.pairing_complete = pairing_complete,
+	.pairing_failed = pairing_failed,
+};
+
+/* ─────────────── deferred BT bring-up (off the device-init path) ─────────── */
+static void start_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	int err;
+
+	err = bt_enable(NULL);
+	if (err && err != -EALREADY) {
+		LOG_ERR("bt_enable failed (%d)", err);
+		return;
+	}
+
+	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+		settings_load(); /* restore bonds/IRKs -- MUST be after bt_enable */
+	}
+
+	bt_conn_auth_cb_register(&auth_cb);
+	bt_conn_auth_info_cb_register(&auth_info_cb);
+
+	LOG_INF("ble-hid-host central up on %s (filter: %s)",
+		host_dev ? host_dev->name : "?",
+		name_filter ? name_filter : "<any HOGP pointer>");
+	start_scan();
+}
+
+static K_WORK_DELAYABLE_DEFINE(start_work, start_work_handler);
+
+int zmk_ble_hid_host_central_start(const struct device *dev, const char *filter)
+{
+	host_dev = dev;
+	name_filter = filter;
+
+	k_work_init(&report_work, report_work_handler);
+
+	/* Defer the heavy BT bring-up so flash/settings are ready and we are off
+	 * the POST_KERNEL device-init thread. */
+	k_work_schedule(&start_work, K_MSEC(500));
+	return 0;
+}
+
+#else /* !CONFIG_BT_CENTRAL */
+
+int zmk_ble_hid_host_central_start(const struct device *dev, const char *filter)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(filter);
+	LOG_WRN("CONFIG_BT_CENTRAL disabled; ble-hid-host will not receive");
+	return 0;
+}
+
+#endif /* CONFIG_BT_CENTRAL */

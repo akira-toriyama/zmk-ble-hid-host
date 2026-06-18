@@ -24,6 +24,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#include "hog_central.h"
+
 LOG_MODULE_REGISTER(ble_hid_host, CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL);
 
 struct ble_hid_host_config {
@@ -59,8 +61,10 @@ static int ble_hid_host_init(const struct device *dev) {
     LOG_INF("ble-hid-host registered (peer filter: %s)",
             cfg->device_name ? cfg->device_name : "<any HOGP pointer>");
 
-    /* M1: start BLE scanning / connect to the peer here. */
-    return 0;
+    /* Hand off to the HOGP central engine. It defers the heavy BT bring-up, so
+     * this is safe from POST_KERNEL device init. (Decode -> input_report_* in
+     * the M3 publish path is wired through this same device.) */
+    return zmk_ble_hid_host_central_start(dev, cfg->device_name);
 }
 
 #define BLE_HID_HOST_INST(n)                                                                       \

@@ -14,3 +14,11 @@
 include:
   - board: xiao_ble/nrf52840/zmk
     shield: ble_hid_host_receiver
+  # On-device validation variant: USB CDC logging so the connect/bond/discover
+  # /decode flow can be watched over serial (cat /dev/cu.usbmodem*), the way the
+  # M1 probe was. Use this .uf2 to confirm the module receives + decodes before
+  # M3 turns reports into cursor motion.
+  - board: xiao_ble/nrf52840/zmk
+    shield: ble_hid_host_receiver
+    cmake-args: -DCONFIG_ZMK_USB_LOGGING=y
+    artifact-name: ble_hid_host_receiver-logging
