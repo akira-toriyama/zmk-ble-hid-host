@@ -15,10 +15,10 @@
  * This module owns the Bluetooth stack: CONFIG_ZMK_BLE is off (the dongle
  * outputs over USB), so ZMK core does not bt_enable()/settings_load() -- we do.
  *
- * Milestone status: M2 logs each decoded report. M3 will publish it on the
- * input device (see the marked call site in report_work_handler) and add
- * Report Reference (0x2908) report-ID matching so only the pointer report is
- * turned into motion.
+ * Milestone status: M3. Each report characteristic's Report Reference (0x2908)
+ * is read so its report-ID is known; the work handler publishes only the report
+ * whose id matches the parsed pointer layout (ble_hid_host_publish), turning it
+ * into INPUT_REL/BTN motion. Non-pointer reports are logged and dropped.
  */
 
 #include "hog_central.h"
@@ -33,6 +33,7 @@ LOG_MODULE_DECLARE(ble_hid_host, CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL);
 
 #include <zephyr/kernel.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/sys/barrier.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
 
@@ -59,31 +60,52 @@ static struct bt_conn *default_conn;
 static struct bt_gatt_discover_params discover_params;
 static struct bt_uuid_16 disc_uuid = BT_UUID_INIT_16(0);
 
-enum disc_state { DISC_IDLE, DISC_HIDS_PRIMARY, DISC_REPORT_MAP_CHRC, DISC_REPORT_CHRC, DISC_CCC };
+enum disc_state {
+	DISC_IDLE,
+	DISC_HIDS_PRIMARY,
+	DISC_REPORT_MAP_CHRC,
+	DISC_REPORT_CHRC,
+	DISC_REPORT_REF,
+	DISC_CCC,
+};
 static enum disc_state disc_state;
 
 static uint16_t hids_end_handle;
 
 /* HID Report Map (0x2A4B): read into rm_buf, then parsed into `layout`.
  *
- * `layout`/`layout_valid` are written on the BT RX workqueue (one-shot at
- * discovery, before any notification flows) and read on the system workqueue
- * (report_work_handler). On single-core M4 a torn read can at worst dirty one
- * M2 log line. Before M3 publishes motion, publish the layout atomically (or
- * double-buffer) so injected deltas can never come from a half-written layout. */
+ * `layout` is written once on the BT RX workqueue (at discovery, before any
+ * notification flows) and read on the system workqueue (report_work_handler,
+ * which now injects motion). To make the layout publish atomically across the
+ * two work queues, the writer fully populates `layout`, then a memory barrier,
+ * then sets the `volatile` `layout_valid` flag; the reader checks the flag,
+ * then a barrier, before touching `layout`. On single-core nRF52840 this rules
+ * out injecting a delta derived from a half-written layout. */
 static struct bt_gatt_read_params rm_read_params;
 static uint8_t rm_buf[REPORT_MAP_MAX];
 static uint16_t rm_len;
 static struct zmk_hid_report_layout layout;
-static bool layout_valid;
+static volatile bool layout_valid;
 
 /* Report value handles found in the CHARACTERISTIC pass, awaiting CCC wiring. */
 static uint16_t pending_reports[MAX_REPORTS];
 static size_t pending_count;
 static size_t pending_idx;
 
-/* Each subscription needs its OWN long-lived params (never one shared global). */
-static struct bt_gatt_subscribe_params sub_params[MAX_REPORTS];
+/* report-ID of the report currently being wired up (from its Report Reference
+ * descriptor 0x2908), valid between the 0x2908 read and the CCC subscribe.
+ * Discovery is sequential, so a single transient is enough. 0 == no/none. */
+static uint8_t cur_report_id;
+static struct bt_gatt_read_params rr_read_params;
+
+/* One subscription per HID Input report. Each needs its OWN long-lived params
+ * (never one shared global); report_id ties the notification back to a Report
+ * Reference so only the pointer report becomes motion (M3). */
+struct hid_subscription {
+	struct bt_gatt_subscribe_params params;
+	uint8_t report_id;
+};
+static struct hid_subscription subs[MAX_REPORTS];
 static size_t sub_count;
 
 /* Cooldown: skip a peer that just failed pairing so the scanner cycles on. */
@@ -100,11 +122,13 @@ struct ad_info {
 
 static void start_scan(void);
 static void subscribe_pending(struct bt_conn *conn);
+static void discover_ccc(struct bt_conn *conn);
 static void start_report_discovery(struct bt_conn *conn);
 
 /* ─────────────── notify -> defer -> decode (k_msgq + k_work) ─────────────── */
 struct report_evt {
 	uint16_t value_handle;
+	uint8_t report_id; /* from the source report's Report Reference (0x2908) */
 	uint8_t len;
 	uint8_t data[32];
 };
@@ -124,17 +148,29 @@ static void report_work_handler(struct k_work *work)
 			LOG_HEXDUMP_DBG(evt.data, evt.len, "report (no layout yet)");
 			continue;
 		}
+		barrier_dmem_fence_full(); /* pair with the publish in report_map_read_cb */
 
-		/* M3 TODO: only decode the characteristic whose Report Reference
-		 * (0x2908) report-ID equals layout.report_id, else non-pointer
-		 * reports (keyboard/consumer) would be injected as motion. For the
-		 * M2 log we decode every report; zmk_hid_decode_report rejects ones
-		 * shorter than the layout needs, and value_handle tags the source. */
+		/* Only the report whose Report Reference (0x2908) report-ID matches the
+		 * parsed pointer layout becomes motion. A peer that multiplexes several
+		 * reports (keyboard/consumer) on one connection would otherwise have its
+		 * non-pointer reports injected as bogus movement.
+		 *
+		 * Exception: with exactly one notifiable report there is nothing to
+		 * disambiguate, so publish it regardless of id. This keeps a single-report
+		 * mouse working even if its Report Reference read failed (which would
+		 * otherwise leave the report tagged id 0 and never match a non-zero
+		 * layout id -- a silently dead cursor). */
+		if (sub_count != 1 && evt.report_id != layout.report_id) {
+			LOG_DBG("ignoring report h=%u id=%u (pointer id=%u)",
+				evt.value_handle, evt.report_id, layout.report_id);
+			continue;
+		}
+
 		if (zmk_hid_decode_report(&layout, evt.data, evt.len, &report) == 0) {
 			LOG_INF("report h=%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%04x",
 				evt.value_handle, report.dx, report.dy, report.wheel,
 				report.hwheel, (unsigned)report.buttons);
-			/* M3: ble_hid_host_publish(host_dev, &report); */
+			ble_hid_host_publish(host_dev, &report);
 		}
 	}
 }
@@ -149,9 +185,11 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 		return BT_GATT_ITER_STOP;
 	}
 
+	struct hid_subscription *sub = CONTAINER_OF(params, struct hid_subscription, params);
 	struct report_evt evt;
 
 	evt.value_handle = params->value_handle;
+	evt.report_id = sub->report_id;
 	evt.len = MIN(length, sizeof(evt.data));
 	memcpy(evt.data, data, evt.len);
 
@@ -194,6 +232,9 @@ static uint8_t report_map_read_cb(struct bt_conn *conn, uint8_t err,
 
 	/* data == NULL: read complete. */
 	if (zmk_hid_parse_report_map(rm_buf, rm_len, &layout) == 0 && layout.valid) {
+		/* Publish `layout` atomically to report_work_handler: the struct is
+		 * fully written above; fence, then flip the volatile flag last. */
+		barrier_dmem_fence_full();
 		layout_valid = true;
 		LOG_INF("report map parsed (%u B): report_id=%u buttons=%u", rm_len,
 			layout.report_id, layout.button_count);
@@ -223,6 +264,55 @@ static void read_report_map(struct bt_conn *conn, uint16_t value_handle)
 	}
 }
 
+/* ──────── Report Reference (0x2908): which report-ID a characteristic carries ─ */
+
+/* Upper handle bound for the descriptors of pending_reports[pending_idx]: stop
+ * before the next report's characteristic declaration, so a report that lacks a
+ * 0x2908/0x2902 can't accidentally pick up the following report's. */
+static uint16_t cur_report_end_handle(void)
+{
+	if (pending_idx + 1 < pending_count) {
+		return pending_reports[pending_idx + 1] - 1;
+	}
+	return hids_end_handle;
+}
+
+static uint8_t report_ref_read_cb(struct bt_conn *conn, uint8_t err,
+				  struct bt_gatt_read_params *params, const void *data,
+				  uint16_t length)
+{
+	ARG_UNUSED(params);
+
+	if (!err && data && length >= 1) {
+		/* Report Reference value: byte[0] = report ID, byte[1] = report type. */
+		cur_report_id = ((const uint8_t *)data)[0];
+	} else {
+		LOG_WRN("report reference read failed (0x%02x); assuming id 0", err);
+		cur_report_id = 0;
+	}
+
+	discover_ccc(conn); /* now wire up this report's CCC and subscribe */
+	return BT_GATT_ITER_STOP;
+}
+
+static void read_report_ref(struct bt_conn *conn, uint16_t handle)
+{
+	int err;
+
+	memset(&rr_read_params, 0, sizeof(rr_read_params));
+	rr_read_params.func = report_ref_read_cb;
+	rr_read_params.handle_count = 1;
+	rr_read_params.single.handle = handle;
+	rr_read_params.single.offset = 0;
+
+	err = bt_gatt_read(conn, &rr_read_params);
+	if (err) {
+		LOG_ERR("report reference read start failed (%d)", err);
+		cur_report_id = 0;
+		discover_ccc(conn); /* fall back: subscribe without an id match */
+	}
+}
+
 /* ───────────────────────── GATT discovery state machine ────────────────── */
 static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			     struct bt_gatt_discover_params *params)
@@ -243,7 +333,17 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 				return BT_GATT_ITER_STOP;
 			}
 			pending_idx = 0;
-			subscribe_pending(conn); /* start CCC discovery for report 0 */
+			subscribe_pending(conn); /* start with report 0's Report Reference */
+		} else if (disc_state == DISC_REPORT_REF) {
+			/* This report has no Report Reference; keep id 0 and subscribe. */
+			discover_ccc(conn);
+		} else if (disc_state == DISC_CCC) {
+			/* This report has no CCC (shouldn't happen for a notifiable
+			 * report); skip it so discovery doesn't wedge. */
+			LOG_WRN("no CCC for report value=%u; skipping",
+				pending_reports[pending_idx]);
+			pending_idx++;
+			subscribe_pending(conn);
 		}
 		return BT_GATT_ITER_STOP;
 	}
@@ -295,23 +395,34 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 		return BT_GATT_ITER_CONTINUE; /* collect them all */
 	}
 
+	case DISC_REPORT_REF: {
+		/* attr is the Report Reference (0x2908) for pending_reports[pending_idx];
+		 * read it to learn this report's report-ID, then resume at the CCC. */
+		read_report_ref(conn, attr->handle);
+		return BT_GATT_ITER_STOP;
+	}
+
 	case DISC_CCC: {
 		/* attr is the CCC (0x2902) for pending_reports[pending_idx]. */
 		if (sub_count < MAX_REPORTS) {
-			struct bt_gatt_subscribe_params *sp = &sub_params[sub_count];
+			struct hid_subscription *s = &subs[sub_count];
 
-			sp->notify = notify_cb;
-			sp->value = BT_GATT_CCC_NOTIFY;
-			sp->value_handle = pending_reports[pending_idx];
-			sp->ccc_handle = attr->handle;
-			sp->min_security = BT_SECURITY_L2;
+			memset(s, 0, sizeof(*s)); /* clear stale node/flags before reuse */
+			s->report_id = cur_report_id;
+			s->params.notify = notify_cb;
+			s->params.value = BT_GATT_CCC_NOTIFY;
+			s->params.value_handle = pending_reports[pending_idx];
+			s->params.ccc_handle = attr->handle;
+			s->params.min_security = BT_SECURITY_L2;
 
-			err = bt_gatt_subscribe(conn, sp);
+			err = bt_gatt_subscribe(conn, &s->params);
 			if (err && err != -EALREADY) {
-				LOG_ERR("subscribe failed (%d) value=%u", err, sp->value_handle);
+				LOG_ERR("subscribe failed (%d) value=%u", err,
+					s->params.value_handle);
 			} else {
-				LOG_INF("subscribed report value=%u ccc=%u", sp->value_handle,
-					sp->ccc_handle);
+				LOG_INF("subscribed report value=%u ccc=%u id=%u",
+					s->params.value_handle, s->params.ccc_handle,
+					s->report_id);
 				sub_count++;
 			}
 		}
@@ -325,7 +436,9 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 	}
 }
 
-/* Discover the CCC for pending_reports[pending_idx]; if exhausted, we're done. */
+/* Wire up pending_reports[pending_idx]: first read its Report Reference (0x2908)
+ * to learn its report-ID, then (in discover_ccc) discover its CCC and subscribe.
+ * When the pending list is exhausted, discovery is done. */
 static void subscribe_pending(struct bt_conn *conn)
 {
 	int err;
@@ -336,10 +449,31 @@ static void subscribe_pending(struct bt_conn *conn)
 		return;
 	}
 
+	cur_report_id = 0; /* default if this report carries no Report Reference */
+
+	memcpy(&disc_uuid, BT_UUID_HIDS_REPORT_REF, sizeof(disc_uuid)); /* 0x2908 */
+	discover_params.uuid = &disc_uuid.uuid;
+	discover_params.start_handle = pending_reports[pending_idx] + 1;
+	discover_params.end_handle = cur_report_end_handle();
+	discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
+	disc_state = DISC_REPORT_REF;
+
+	err = bt_gatt_discover(conn, &discover_params);
+	if (err) {
+		LOG_ERR("report-ref discover failed (%d); subscribing without id", err);
+		discover_ccc(conn); /* fall back to CCC + subscribe, id stays 0 */
+	}
+}
+
+/* Discover the CCC (0x2902) for pending_reports[pending_idx], then subscribe. */
+static void discover_ccc(struct bt_conn *conn)
+{
+	int err;
+
 	memcpy(&disc_uuid, BT_UUID_GATT_CCC, sizeof(disc_uuid)); /* 0x2902, NOT 0x2908 */
 	discover_params.uuid = &disc_uuid.uuid;
 	discover_params.start_handle = pending_reports[pending_idx] + 1;
-	discover_params.end_handle = hids_end_handle;
+	discover_params.end_handle = cur_report_end_handle();
 	discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
 	disc_state = DISC_CCC;
 
@@ -593,6 +727,15 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	 * DIFFERENT bonded peer (BT_MAX_PAIRED=2). */
 	layout_valid = false;
 	rm_len = 0;
+	/* Drop this peer's still-queued reports so none can be matched against the
+	 * NEXT peer's layout (the report-id guard alone misses two peers that share
+	 * a report id). disconnected() and notify_cb both run on the BT RX context,
+	 * so no new event can be enqueued after this purge. */
+	k_msgq_purge(&report_msgq);
+	/* Release any button held at disconnect so it doesn't latch on the host PC. */
+	if (host_dev) {
+		ble_hid_host_reset(host_dev);
+	}
 
 	start_scan(); /* auto-reconnect: re-scan, match the bonded peer, re-discover */
 }

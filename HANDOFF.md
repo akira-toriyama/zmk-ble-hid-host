@@ -3,13 +3,17 @@
 > セッションをまたいで作業を継続するための正本。**未達成を暗黙にしない**。
 > 各セッション終了時にここを更新する。会話言語は日本語。
 
-最終更新: 2026-06-18（**M1 ✅ + M2 デコード核 ✅ + ファームビルド CI ✅ + hog_central 移植 ✅**。
-このセッションで M2 残を一気に解消: ① モジュール用ファームビルド CI を立てて **GitHub Actions で green**
-（`.uf2` 産出）＝M1-7 の最大関門クリア。② `hog_central.c` を probe から移植（scan→bond→discovery→
-**Report Map 読込+parse**→subscribe→**k_work 退避→decode→ログ**）。多エージェント敵対レビュー済み。
-**アーキ確定**: USB 出力専用＝`CONFIG_ZMK_BLE=n` で `BT_SMP_SC_PAIR_ONLY` の select を外し、レガシー
-Just Works を開通（実ビルドの `.config` で `# CONFIG_BT_SMP_SC_PAIR_ONLY is not set` を確認＝最大リスク消滅）。
-詳細 §M2b。**残るは M3 publish（decode→`input_report_*`＝カーソルが動く）のみ。設計は §4 に精密化。**）
+最終更新: 2026-06-18（**M1 ✅ + M2 デコード核 ✅ + ファームビルド CI ✅ + hog_central 移植 ✅ + M3 publish 実装 ✅**。
+このセッションで **M3 publish を実装**＝唯一の残りを解消: ① `hog_central.c` の discovery に **Report Reference
+(0x2908) 読込→report-ID マッチング**を追加（DISC_REPORT_REF 新状態。各 report char の id を読み、**layout.report_id
+と一致する pointer report だけ**を motion 化。keyboard/consumer report はログして捨てる）。② `ble_hid_host.c` に
+**`ble_hid_host_publish()`** を実装（ボタン差分=`INPUT_BTN_0..4`、`INPUT_REL_X/Y/HWHEEL`、終端 `INPUT_REL_WHEEL`
+を `sync=true` で flush）。③ `layout` を**バリア+volatile で atomic publish**（M2b の deferred 解消）。
+**4観点の敵対レビュー実施→4 findings 全適用**: ④ disconnect で `k_msgq_purge`（前ペアの残レポートが次ペアの layout で
+誤デコードされる窓を封鎖）、⑤ disconnect で `ble_hid_host_reset`（押下中ボタンが PC に latch するのを解除）、
+⑥ ドロップしたボタン edge は `prev_buttons` を進めない（applied マスク）、⑦ 単一 report 機は id チェック bypass。
+**default + logging 両 `.uf2` が Docker で green**（FLASH 24.4%/RAM 15.6%）。詳細 §M3。
+**残るは P-C（実機でカーソルが動くか）の確認のみ → その後 M4（リマップ）。** 設計の続きは §4。）
 計画書: `/Users/tommy/.claude/plans/distributed-hatching-hejlsberg.md`
 元ブリーフ: `/Users/tommy/Downloads/zmk-ble-hid-host-brief.md`
 
@@ -20,8 +24,9 @@ Just Works を開通（実ビルドの `.config` で `# CONFIG_BT_SMP_SC_PAIR_ON
 XIAO nRF52840 を「BLE トラックボール(Elecom IST PRO)を BLE central で受け、デコードして
 ZMK の input subsystem に流す」モジュール。リマップ／出力は ZMK 本体に丸投げ（受信専用）。
 
-- **現在のマイルストーン: M0 完了 → M1 達成 ✅（受信を実機実証, §M1）→ M2 デコード核 完了 ✅（§M2）。
-  次は M2残(`hog_central.c`移植＋モジュール用ファームビルド CI)→M3(publish=カーソルが動く)。最終像は §4。**
+- **現在のマイルストーン: M0 → M1 ✅（受信を実機実証, §M1）→ M2 デコード核 ✅（§M2）→ M2b ファームビルド CI +
+  hog_central 移植 ✅（§M2b, P-B' 実機実証）→ M3 publish 実装 ✅（§M3, ビルド green）。
+  次は P-C（実機でカーソルが動くか）の確認 → M4(リマップ)。最終像は §4。**
 - ZMK 本体は fork しない。3層構成（zmk 無改変 + 本モジュール + ユーザ zmk-config）。
   - ユーザの zmk-config = **`akira-toriyama/canon`**（Cyboard Imprint 分割キーボード）。
     ただし本ドングルは別デバイス → **M4 で「自己完結 or canon に統合」を選択**（今は canon を触らない）。
@@ -181,7 +186,53 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
 
 **現状の到達**: モジュールが「BLE 受信→Report Map 解析→デコード→**ログ**」する `.uf2` が CI/Docker で green、**かつ実機実証済み
 （P-B' ✅, §6）**: 焼いて IST PRO と bond→320B Report Map 解析→ボール移動で `dx/dy` がデコードされログに追従。**カーソルはまだ動かない**
-（M2＝ログのみ、publish は M3）。残りは §4 の M3 のみ＝この `dx/dy` を `input_report_*` に流すだけ。
+（M2＝ログのみ、publish は M3）。残りは §4 の M3 のみ＝この `dx/dy` を `input_report_*` に流すだけ。→ **§M3 で実装済み。**
+
+## §M3. publish 実装（完了 ✅, 2026-06-18）— デコード→`input_report_*`＝カーソルが動く
+
+「decode→**ログ**」だった work handler を「decode→**publish**」に拡張。これで USB HID 経由で PC のカーソルが動く（はず＝P-C 実機待ち）。
+触ったのは3ファイル（`drivers/input/{ble_hid_host.c,hog_central.c,hog_central.h}`）。**ZMK 本体は無改変。**
+
+**① Report Reference (0x2908) → report-ID マッチング**（`hog_central.c`）:
+- discovery state machine に **`DISC_REPORT_REF`** を追加。各 report char ごとに「**0x2908 を discover→read で report-ID 取得**→
+  **0x2902(CCC) を discover→subscribe**」の順に拡張（旧 CCC ロジックは `discover_ccc()` に分離。`subscribe_pending()` が 0x2908 から開始）。
+- subscribe params を **`struct hid_subscription { bt_gatt_subscribe_params params; uint8_t report_id; }`** 化（`subs[]`）。
+  `notify_cb` は `CONTAINER_OF(params, struct hid_subscription, params)` で report-ID を取り、`report_evt.report_id` に載せる。
+- work handler は **`evt.report_id == layout.report_id` の report だけ** publish（他はログして捨てる）。**例外**: 通知 report が1本だけなら
+  曖昧さが無いので id チェックを bypass（単一 report 機が 0x2908 read 失敗でも動く＝サイレント死防止、後述 review 適用 ⑦）。
+- descriptor 探索窓は **`cur_report_end_handle()`**＝次 report の char 宣言の手前まで（0x2908/0x2902 を持たない report が隣の物を拾わない）。
+- 0x2908 が**無い/読めない**場合は id=0 にフォールバック（`!attr` 分岐 or read err 分岐から `discover_ccc()`）。
+
+**② publish 本体**（`ble_hid_host.c` `ble_hid_host_publish()`）:
+- **ボタン**: `r->buttons ^ prev_buttons` の変化ビット `i`(0..4) ごとに `input_report_key(dev, INPUT_BTN_0+i, 押下, false, K_NO_WAIT)`。
+  **`INPUT_BTN_0`(0x100) を使う**（ZMK の `input_listener.c` が消費するのは `INPUT_BTN_0..4`。`INPUT_BTN_LEFT`(0x110) ではない）。
+  **bit0=左**→`INPUT_BTN_0`→mouse button0(左)。ZMK mouse HID は5ボタンなので **5個で cap**（`BLE_HID_HOST_PUBLISH_BTNS=5`）。
+- **移動**: dx/dy/hwheel が非0なら `input_report_rel(dev, INPUT_REL_X/Y/HWHEEL, 値, false, K_NO_WAIT)`。
+- **終端 sync**: `input_report_rel(dev, INPUT_REL_WHEEL, r->wheel, true, K_NO_WAIT)`（wheel==0 でも sync=true で listener が1回 flush）。
+  listener は `evt->sync` で HID 更新を処理（`input_listener.c`）。`CONFIG_INPUT_MODE_THREAD=y`＝input_report は queue 投入（16深）→
+  別スレッドで処理。だから **system workqueue から K_NO_WAIT 呼び出しはブロックしない**（満杯時は drop=-errno）。
+
+**③ layout の atomic publish**（M2b deferred 解消）: `layout_valid` を **`volatile`** 化。writer(report_map_read_cb)は
+`layout` 全書込→`barrier_dmem_fence_full()`→flag=true。reader(work handler)は flag 確認→`barrier_dmem_fence_full()`→`layout` 読込。
+単一コア nRF52840 で half-written layout 由来の delta 注入を排除。
+
+**4観点の敵対レビュー（10エージェント, GATT状態機械/並行性/publish意味論/edge）→ 4 findings 全適用**:
+- ④【medium】disconnect で **`k_msgq_purge(&report_msgq)`**: 前ペアの残レポートが次ペアの layout で誤デコードされる窓を封鎖
+  （report-id guard だけでは **同 id の2機**を取りこぼす。BT_MAX_PAIRED=2）。disconnect も notify_cb も BT RX 文脈なので race-free。
+- ⑤【medium】disconnect で **`ble_hid_host_reset(host_dev)`**: 押下中ボタンの release を送って PC の latch を解除（圏外 drag 対策）。
+  最後の release を sync=true で flush。`prev_buttons` も 0 クリア（次ペアを clean slate に）。
+- ⑥【low】publish のボタンは **`input_report_key` が成功(==0)した bit だけ `prev_buttons` を進める**（applied マスク）。
+  満杯 drop された edge を次レポートで再送＝取りこぼし press の latch を防ぐ。**式は `(prev & ~applied)|(buttons & applied)`**
+  （review 提案の `~changed` は release-drop で誤るので訂正済み）。
+- ⑦【low】上記①の「単一 report は id チェック bypass」＝0x2908 read 失敗時のサイレント死防止。
+- refute された懸案: happy path（IST PRO report_id=2, 0x2908 read 成功）は全 finding の影響を受けない＝**カーソルは動く**。
+
+**ビルド**: default `zmk.uf2` 393728B（FLASH 24.39%/RAM 15.56%）、logging variant 466944B、両方 Docker で green
+（`validate-both.sh`）。`nm` で `ble_hid_host_publish`/`ble_hid_host_reset`/`k_msgq_purge` link 確認。**ホスト純粋核テストは無改変で
+そのまま（M2 の parser/decoder は変更なし）。**
+
+**残り = P-C のみ**: tommy さんが default `.uf2`（または先に logging variant でログ確認）を XIAO に焼いて
+「カーソルが動く」を実機確認（§6 P-C）。手戻りが出たら §M1 採取手順 + logging ログで切り分け。
 
 ## 2. 完了（M0）＝ 検証済み
 
@@ -206,9 +257,10 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
       **GitHub Actions で green**＋ローカル Docker でも `.uf2` 産出。board=`xiao_ble/nrf52840/zmk`。全 Zephyr 側コードの検証ゲート確立。
 - [x] **BLE 受信(M1) ✅実機実証**（§M1）／ **デコード(M2核) ✅ホスト検証**（§M2）／ **`hog_central.c` 移植 ✅ビルド green**（§M2b）。
       `drivers/input/CMakeLists.txt` の parser/decoder/hog_central は**全て有効化済み**。
-- [ ] **M3 publish 未実装＝唯一の残り**（decode→`input_report_*`）。現状はデコード結果を**ログ出力のみ**（カーソルは動かない）。設計 §4。
-- [ ] **実機検証は未**: ①M2 受信/デコードが実機で動くか（logging variant を焼いて `cat` でログ確認＝P-B' 推奨）、
-      ②M3 でカーソルが動くか（§6 P-C）。XIAO・IST PRO は tommy さん手元にあり実機作業可（2026-06-18 確認）。
+- [x] **M3 publish ✅実装＋ビルド green**（decode→`input_report_*`, §M3）。Report Reference(0x2908) id マッチング＋
+      `ble_hid_host_publish`＋layout atomic 化＋敵対レビュー4件適用。default/logging 両 `.uf2` Docker green。**実機(P-C)は未。**
+- [ ] **実機検証(P-C)＝唯一の残り**: M3 でカーソルが動くか（§6 P-C）。先に logging variant でログ確認推奨（§4 手順）。
+      XIAO・IST PRO は tommy さん手元にあり実機作業可（2026-06-18 確認）。M2 受信/デコードは P-B' で実機実証済み。
 - [x] `.conf` の Kconfig 同時有効化でビルドが通ることを**確認済み**（§M2b の実ビルド `.config`）。
 
 ## 4. 次にやること
@@ -229,45 +281,31 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
 - **③の置き場所＝M4 の分岐**: 自己完結ドングル config か、ユーザの `akira-toriyama/canon`(Cyboard Imprint)に統合か。
   ①②を出すだけなら **専用ドングル ZMK ビルドが最短**。canon は M4 まで触らない（§1 方針）。
 
-### ▶ 次セッション = M3 publish（カーソルが動く）＝ 唯一の残り
+### ▶ 次 = P-C 実機確認（👤 tommy）＝ M3 の唯一の残り
 
-ファームビルド CI・decode 有効化・`hog_central.c` 移植は**完了済み（§M2b, ブランチ `feat/m2-firmware-build`）**。
-今のファームは「受信→デコード→**ログ**」まで。残りは decode 結果を input subsystem に publish するだけ。
+M3 publish はコード完了・ビルド green（§M3, ブランチ `feat/m2-firmware-build` に commit 済み）。あとは**焼いて動かす**だけ。
 
-**0. （推奨・着手前）M2 を実機で先に確認**: logging variant `.uf2`（CI artifact `ble_hid_host_receiver-logging` か
-   ローカル `build-log/zephyr/zmk.uf2`）を XIAO に焼き、IST PRO を繋ぎ、`cat /dev/cu.usbmodem<XXX>` で
-   `connected`→`secured`→`report map parsed`→`report h=.. dx=.. dy=..` が出るか確認（§M1 の採取手順流用）。
-   これで「BLE 受信〜デコード」が実機で正しいと確定してから M3 に入ると手戻りが無い。**watch すべき**: ①重複通知
-   （出たら `BT_GATT_SUBSCRIBE_FLAG_NO_RESUB` を検討）、②`report queue full; dropping`（出たら msgq 深さ増 or 退避見直し）。
+**0.（推奨）先に logging variant でログ確認**: `validate-both.sh` 産物 `/ws/build-log/zephyr/zmk.uf2`（または CI artifact
+   `ble_hid_host_receiver-logging`）を XIAO に焼き、IST PRO を繋ぎ、`cat /dev/cu.usbmodem<XXX>` で
+   `connected`→`secured`→`report map parsed (... report_id=2 ...)`→`subscribed report value=.. ccc=.. id=..`（**id=2 の行があるはず**）
+   →ボール移動で `report h=.. dx=.. dy=..` が出るか確認（§M1 の `cat` background+kill 採取手順流用）。
+   **watch すべき**: ①`ignoring report h=.. id=.. (pointer id=2)` が pointer 以外で出る＝正常（keyboard/consumer を捨てている）。
+   ②`report queue full; dropping` / input queue drop が頻発したら msgq 深さや負荷を見直し。③重複通知が出たら `BT_GATT_SUBSCRIBE_FLAG_NO_RESUB`。
 
-**1. Report Reference (0x2908) で report-ID マッチング（publish の前提）**: 今は全 notifiable report をデコードして
-   いる（M2 ログでは無害）。publish では**ポインタ report だけ**を motion 化しないと、キーボード/コンシューマ report が
-   ゴミ移動になる。`hog_central.c` の discovery で各 report char の Report Reference 記述子(0x2908)を read して
-   `report_id` を得て、`sub_params` に併存させる（`struct { struct bt_gatt_subscribe_params params; uint8_t report_id; }`
-   にして `notify_cb` で `CONTAINER_OF`）。work handler は `report_id == layout.report_id` の時だけ publish。
-   実装: subscribe_pending を「0x2908 を discover→read で report_id 取得→0x2902(CCC) discover→subscribe」に拡張
-   （uuid=NULL で記述子一括 discover し 0x2902/0x2908 を仕分ける手もある）。
+**1. default `.uf2` を焼いて P-C 判定**: `/ws/build/zephyr/zmk.uf2`（または CI default artifact）を **トラックボール用の XIAO** に
+   物理ダブルタップで焼く（§M1 手順。`fcopyfile I/O error` でも焼けている）→IST PRO 接続→**PC のカーソルが動く＝P-C 達成**。
+   ボタン（左/右/中/戻る/進む＝5個）も効くか確認。軸反転/scaling/snipe/scroll は keymap の input-processors で（§M1 `ist_pro.keymap.snippet` 参考）＝M4。
 
-**2. publish 実装（`ble_hid_host.c`）**: 既存コメント「M3 publish contract」(行 40-51)を実装。
-   `ble_hid_host_publish(const struct device *dev, const struct zmk_hid_pointer_report *r)` を公開し、hog_central の
-   work handler（`report_work_handler`）の `/* M3: ble_hid_host_publish(host_dev, &report); */` から呼ぶ。本体:
-   - **ボタン**: `ble_hid_host_data` に `uint32_t prev_buttons` を追加。`r->buttons ^ prev_buttons` の変化ビット i ごとに
-     `input_report_key(dev, INPUT_BTN_0+i, (r->buttons>>i)&1, false, K_NO_WAIT)`。**`INPUT_BTN_0/1/2`(0x100..) を使う**
-     （`input_listener.c` は `INPUT_BTN_0..4`+`TOUCH` を消費。`INPUT_BTN_LEFT/RIGHT`(0x110..) ではない）。最後に `prev_buttons=r->buttons`。
-   - **移動**: dx/dy/hwheel が非0なら `input_report_rel(dev, INPUT_REL_X/Y/HWHEEL, 値, false, K_NO_WAIT)`。
-   - **sync**: 終端 event を `input_report_rel(dev, INPUT_REL_WHEEL, r->wheel, true, K_NO_WAIT)`（wheel==0 でも sync=true で listener を flush）。
-   - `CONFIG_ZMK_POINTING=y`（既に有効）で ZMK core が REL/BTN を mouse HID 化して USB 出力。listener+device は shield overlay に配線済み。
-   - **layout を atomic 化**（§M2b の deferred）: publish 前に layout を atomic publish か double-buffer swap にし、
-     注入する delta が half-written layout 由来にならないようにする。
+**手戻り時の切り分け**: logging variant で「どこまで出るか」を見る。`report map parsed` が出ない→discovery/Report Map read 問題。
+   `subscribed ... id=2` が無い→0x2908 read 失敗（id=0 になり pointer が ignore される。ただし通知1本なら bypass で動く）。
+   `report h=.. dx=..` は出るがカーソル動かず→publish/listener/USB HID 側（`CONFIG_ZMK_POINTING`/overlay 配線を疑う）。
 
-**3. ビルド→実機**: ローカル Docker で green 確認→push→CI green。default `.uf2` を XIAO（トラックボール用の方）に
-   物理ダブルタップで焼く→IST PRO 接続→**カーソルが動く**（P-C 達成）。軸反転/scaling 等は keymap の input-processors（§M1 参考、`ist_pro.keymap.snippet`）。
+DoD（M3）: ✅実装→✅ビルド green→**👤 tommy さんが焼いて「カーソルが動く」を実機確認（P-C）**。これで①完了。次は②リマップ＝M4。
+ブランチ: `feat/m2-firmware-build` に M3 を commit（M2b+M3 で一つの「受信→カーソルが動く」PR）。push 認可済み（§8 ＋ 2026-06-18 明示再確認）。
 
-DoD: M3 publish 実装→ビルド green→tommy さんが焼いて「カーソルが動く」を実機確認（P-C）。
-ブランチ案: 現 `feat/m2-firmware-build` に重ねるか `feat/m3-publish` を分岐。push 認可済み（§8 ＋ 2026-06-18 セッションで明示再確認）。
-
-参考: デコード期待値の正解表は `tests/parser/fixtures/ist_pro.live_reports.hex` のコメント。`input_report_rel` 署名は
-`input_report_rel(dev, code, value, sync, k_timeout_t)`（§8 検証済）。input コード値: `INPUT_REL_X`=0x00 `Y`=0x01 `HWHEEL`=0x06 `WHEEL`=0x08、`INPUT_BTN_0`=0x100。
+参考: デコード期待値の正解表は `tests/parser/fixtures/ist_pro.live_reports.hex` のコメント。`input_report_rel/key` 署名は
+`(dev, code, value, sync, k_timeout_t)`（§8 検証済）。input コード値: `INPUT_REL_X`=0x00 `Y`=0x01 `HWHEEL`=0x06 `WHEEL`=0x08、`INPUT_BTN_0`=0x100。
+ローカル両ビルド: `docker run --rm -v <repo>:/repo:ro -v /Volumes/workspace/.zmk-blehh-build:/ws -w /ws zmkfirmware/zmk-build-arm:stable bash /ws/validate-both.sh`。
 
 手本（ローカル checkout、行番号は変わり得るので関数名で追う）:
 - `…/zmk/app/src/split/bluetooth/central.c` … scan→connect→discover→subscribe の状態機械の正本。

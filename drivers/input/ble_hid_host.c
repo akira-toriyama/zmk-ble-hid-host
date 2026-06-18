@@ -24,9 +24,17 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#include <zmk_ble_hid_host/hid_report_parser.h>
+
 #include "hog_central.h"
 
 LOG_MODULE_REGISTER(ble_hid_host, CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL);
+
+/* ZMK's input-listener consumes INPUT_BTN_0..4 (button index == code -
+ * INPUT_BTN_0) -- 5 buttons, matching the standard mouse HID report. Buttons
+ * beyond that are decoded but have no HID slot downstream, so we don't emit
+ * them. */
+#define BLE_HID_HOST_PUBLISH_BTNS 5
 
 struct ble_hid_host_config {
     const char *device_name;
@@ -34,23 +42,89 @@ struct ble_hid_host_config {
 
 struct ble_hid_host_data {
     const struct device *dev;
-    /* M1: BLE central / HOGP connection state lands here
-     * (struct bt_conn *, subscribe params, discovered handles, and the
-     *  parsed struct zmk_hid_report_layout for the connected peer). */
+    /* Previous report's button bitmask, for edge-triggered button events.
+     * Only ever touched from the single report work handler (one peer at a
+     * time), so no locking is needed. */
+    uint32_t prev_buttons;
 };
 
 /*
- * M3 publish contract (implemented in milestone M3):
+ * Publish one decoded pointer report as ZMK input events (the M3 ingest path).
  *
- *   On each decoded report, emit input events on `data->dev`:
- *     - per changed button: input_report_key(dev, INPUT_BTN_*, pressed, false, K_NO_WAIT)
- *       (edge-triggered vs. the previous report's button bitmask)
- *     - input_report_rel(dev, INPUT_REL_X,      dx,     false, ...)  if dx
- *     - input_report_rel(dev, INPUT_REL_Y,      dy,     false, ...)  if dy
- *     - input_report_rel(dev, INPUT_REL_HWHEEL, hwheel, false, ...)  if hwheel
- *     - input_report_rel(dev, INPUT_REL_WHEEL,  wheel,  true,  ...)  <-- sync=true
- *   The final event carries sync=true so the listener processes one HID update.
+ * Called from hog_central's report work handler (system workqueue) for the
+ * pointer report only. Emits, in order:
+ *   - per changed button (edge vs. prev_buttons): input_report_key(BTN_i)
+ *   - input_report_rel(REL_X / REL_Y / REL_HWHEEL) when non-zero
+ *   - input_report_rel(REL_WHEEL, wheel, sync=true) as the terminator
+ * Every event but the last carries sync=false; the final WHEEL event sets
+ * sync=true (even when wheel == 0) so the listener flushes exactly one HID
+ * update covering this whole report. K_NO_WAIT: never block the workqueue.
  */
+void ble_hid_host_publish(const struct device *dev,
+                          const struct zmk_hid_pointer_report *r) {
+    struct ble_hid_host_data *data = dev->data;
+
+    /* Buttons: emit only the bits that changed since the last report, and
+     * advance prev_buttons ONLY for edges the input queue actually accepted
+     * (INPUT_MODE_THREAD drops with -errno when full). A dropped edge is left
+     * un-advanced so it is retried on the next report instead of latching. */
+    uint32_t changed = (r->buttons ^ data->prev_buttons);
+    uint32_t applied = 0;
+
+    for (int i = 0; i < BLE_HID_HOST_PUBLISH_BTNS; i++) {
+        if (changed & (1u << i)) {
+            if (input_report_key(dev, INPUT_BTN_0 + i, (r->buttons >> i) & 1u,
+                                 false, K_NO_WAIT) == 0) {
+                applied |= (1u << i);
+            }
+        }
+    }
+    data->prev_buttons = (data->prev_buttons & ~applied) | (r->buttons & applied);
+
+    /* Relative motion / horizontal scroll: skip zero deltas (no-op events). */
+    if (r->dx) {
+        input_report_rel(dev, INPUT_REL_X, r->dx, false, K_NO_WAIT);
+    }
+    if (r->dy) {
+        input_report_rel(dev, INPUT_REL_Y, r->dy, false, K_NO_WAIT);
+    }
+    if (r->hwheel) {
+        input_report_rel(dev, INPUT_REL_HWHEEL, r->hwheel, false, K_NO_WAIT);
+    }
+
+    /* Terminator: WHEEL carries sync=true so the listener processes one update.
+     * Emitted unconditionally (even wheel == 0) so a button-only or move-only
+     * report is still flushed. */
+    input_report_rel(dev, INPUT_REL_WHEEL, r->wheel, true, K_NO_WAIT);
+}
+
+/*
+ * Release every button the host still believes is pressed, then clear the
+ * button state. Called by hog_central when the BLE link drops so a button held
+ * at disconnect (e.g. a click-drag that goes out of range) does not latch on the
+ * PC, and so the next peer (BT_MAX_PAIRED=2) starts from a clean slate. The last
+ * release carries sync=true to flush; a no-op when nothing was held.
+ */
+void ble_hid_host_reset(const struct device *dev) {
+    struct ble_hid_host_data *data = dev->data;
+    uint32_t held = data->prev_buttons;
+    int last = -1;
+
+    if (!held) {
+        return; /* nothing latched; no event needed */
+    }
+    for (int i = 0; i < BLE_HID_HOST_PUBLISH_BTNS; i++) {
+        if (held & (1u << i)) {
+            last = i;
+        }
+    }
+    for (int i = 0; i < BLE_HID_HOST_PUBLISH_BTNS; i++) {
+        if (held & (1u << i)) {
+            input_report_key(dev, INPUT_BTN_0 + i, 0, i == last, K_NO_WAIT);
+        }
+    }
+    data->prev_buttons = 0;
+}
 
 static int ble_hid_host_init(const struct device *dev) {
     struct ble_hid_host_data *data = dev->data;
