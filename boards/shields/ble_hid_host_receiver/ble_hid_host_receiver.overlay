@@ -1,0 +1,46 @@
+/*
+ * Copyright (c) 2026 akira-toriyama
+ * SPDX-License-Identifier: MIT
+ *
+ * Minimal "receiver" shield for a Seeed XIAO nRF52840 acting as a dedicated
+ * USB trackball dongle. It has NO physical key matrix, so it uses a
+ * zmk,kscan-mock (0 events) -- exactly like ZMK's settings_reset shield -- to
+ * satisfy the mandatory `zmk,kscan` chosen node without any GPIO.
+ *
+ * The real input comes from the zmk,ble-hid-host virtual device, which (from
+ * the hog_central milestone onward) connects to the BLE trackball as a HOGP
+ * central, decodes its reports, and republishes them into ZMK's input system.
+ */
+
+#include <dt-bindings/zmk/matrix_transform.h>
+
+/ {
+    chosen {
+        zmk,kscan = &mock_kscan;
+    };
+
+    mock_kscan: kscan {
+        compatible = "zmk,kscan-mock";
+        columns = <1>;
+        rows = <0>;
+
+        events = <>;
+    };
+
+    /* The BLE HID host virtual input device (BLE central to the trackball). */
+    trackball: ble_hid_host {
+        compatible = "zmk,ble-hid-host";
+
+        /* Optional: only connect to a peer advertising this EXACT name.
+         * The IST PRO advertises as "IST PRO" (confirmed on-device, M1).
+         * Leave commented to connect to the first discovered HOGP pointer. */
+        // device-name = "IST PRO";
+    };
+
+    /* Feed decoded motion into ZMK. Input-processors are attached in the
+     * keymap via the &trackball_listener label. */
+    trackball_listener: trackball_listener {
+        compatible = "zmk,input-listener";
+        device = <&trackball>;
+    };
+};

@@ -1,0 +1,17 @@
+name: Build ZMK firmware
+
+# Builds the dedicated XIAO nRF52840 trackball-dongle firmware (the
+# ble_hid_host_receiver shield) and uploads a flashable .uf2 artifact.
+#
+# This is the verification gate for ALL Zephyr-side module code: it reuses
+# ZMK's build-user-config workflow, which detects zephyr/module.yml at the repo
+# root and injects this repo via -DZMK_EXTRA_MODULES (board_root makes the
+# bundled shield discoverable). The build matrix is build.yaml at the repo root.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: zmkfirmware/zmk/.github/workflows/build-user-config.yml@main

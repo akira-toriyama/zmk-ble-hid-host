@@ -1,0 +1,24 @@
+# GitHub Actions build matrix for the dedicated XIAO nRF52840 trackball dongle.
+# Produces a flashable .uf2 via ZMK's reusable build-user-config workflow.
+#
+# NOTE: this file must live at the repo ROOT -- the reusable workflow's default
+# build_matrix_path is "build.yaml" (config_path defaults to "config/").
+#
+# board target `xiao_ble/nrf52840/zmk` is the ZMK board variant on current
+# zmk@main (defined by app/boards/seeed/xiao_ble/xiao_ble_zmk.dts +
+# xiao_ble_zmk_defconfig). Plain `xiao_ble` is the raw-Zephyr board (what the
+# M1 probe used) and is NOT the right target for a ZMK firmware build. Verified
+# against akira-toriyama/canon, whose `imprint_dongle` builds green on this
+# exact board id.
+---
+include:
+  - board: xiao_ble/nrf52840/zmk
+    shield: ble_hid_host_receiver
+  # On-device validation variant: USB CDC logging so the connect/bond/discover
+  # /decode flow can be watched over serial (cat /dev/cu.usbmodem*), the way the
+  # M1 probe was. Use this .uf2 to confirm the module receives + decodes before
+  # M3 turns reports into cursor motion.
+  - board: xiao_ble/nrf52840/zmk
+    shield: ble_hid_host_receiver
+    cmake-args: -DCONFIG_ZMK_USB_LOGGING=y
+    artifact-name: ble_hid_host_receiver-logging

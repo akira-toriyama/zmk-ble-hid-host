@@ -1,0 +1,8 @@
+file_format: "1"
+id: ble_hid_host_receiver
+name: BLE HID Host Receiver (IST PRO dongle)
+type: shield
+url: https://github.com/akira-toriyama/zmk-ble-hid-host
+requires: [seeed_xiao]
+features:
+  - pointer

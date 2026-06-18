@@ -1,0 +1,21 @@
+# West manifest for building this module's firmware in CI.
+#
+# This repo plays TWO roles in a ZMK firmware build (see HANDOFF.md §M2/§4):
+#   1. zmk-config  -- this config/ directory (consumed via `west init -l config`)
+#   2. Zephyr module -- the repo root (auto-injected via -DZMK_EXTRA_MODULES
+#      because zephyr/module.yml exists; the reusable workflow detects it).
+#
+# So we only need to import zmk here; the module itself does not need a project
+# entry. Do NOT copy probe/west.yml -- that is a raw-Zephyr "app=manifest"
+# layout with a name-blocklist and would pull bare Zephyr instead of zmk/app.
+manifest:
+  remotes:
+    - name: zmkfirmware
+      url-base: https://github.com/zmkfirmware
+  projects:
+    - name: zmk
+      remote: zmkfirmware
+      revision: main
+      import: app/west.yml
+  self:
+    path: config
