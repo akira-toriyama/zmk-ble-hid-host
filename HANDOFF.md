@@ -179,8 +179,9 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
 **検証用 logging variant**: `build.yaml` に `-DCONFIG_ZMK_USB_LOGGING=y`（artifact `..._logging`）を追加。`CONFIG_USB_CDC_ACM=y` が入り、
 ユーザが **`cat /dev/cu.usbmodem<XXX>`** で connect/bond/discover/decode のログを M1 と同様に採取できる（M3 前の実機検証用）。
 
-**現状の到達**: モジュールが「BLE 受信→Report Map 解析→デコード→**ログ**」する `.uf2` が CI/Docker で green。**カーソルはまだ動かない**
-（M2＝ログのみ、publish は M3）。残りは §4 の M3 のみ。
+**現状の到達**: モジュールが「BLE 受信→Report Map 解析→デコード→**ログ**」する `.uf2` が CI/Docker で green、**かつ実機実証済み
+（P-B' ✅, §6）**: 焼いて IST PRO と bond→320B Report Map 解析→ボール移動で `dx/dy` がデコードされログに追従。**カーソルはまだ動かない**
+（M2＝ログのみ、publish は M3）。残りは §4 の M3 のみ＝この `dx/dy` を `input_report_*` に流すだけ。
 
 ## 2. 完了（M0）＝ 検証済み
 
@@ -315,6 +316,13 @@ M1 のサブステップ:
 - [x] **P-B M1 動作確認 ✅（2026-06-18）**。物理ダブルタップで `probe/firmware/zephyr.uf2` を焼き、
       `cat /dev/cu.<live>` でログ採取。IST PRO をペアリングモードに → **bond→subscribe→生レポート 5742件**確認。
       決め手はレガシー許可（§M1）。7.5ms 接続間隔も受諾。fixture = `tests/parser/fixtures/ist_pro.live_reports.hex`。
+- [x] **P-B' M2 動作確認 ✅（2026-06-18）= モジュール側パイプライン実機実証**。logging variant `.uf2`
+      (`ble_hid_host_receiver-logging`) を XIAO に焼き、`cat /dev/cu.usbmodem21101` で採取。IST PRO をペアリングモードに →
+      **`connected`→`secured (level 2)`→`paired (bonded=1)`→`report map parsed (320 B): report_id=2 buttons=8`→
+      `subscribed to 5 report(s)`→ボール移動で `report h=49 dx=.. dy=..` が動きに追従**。**=レガシー JW bond / ランタイム
+      Report Map 解析(read-long 320B)/ デコードが全部実機で正しいと確定**（M3 の手戻りリスク消滅）。
+      軽微: subscribe 中に `bt_conn: Not enough buffer space for L2CAP data` が2回（自己回復、5本 subscribe 成功。M3 で
+      負荷増えたら `CONFIG_BT_L2CAP_TX_BUF_COUNT`/`BT_BUF_ACL_*` 増を検討）。pointer は report_id=2＝value handle 49。
 - [ ] **P-C M3 動作確認** 👤  PC で実際にカーソルが動くか。
 - [ ] **P-D M4 調整** 👤  リマップ(軸反転/swap/scaling/snipe/scroll)が効くか、processor パラメータ実調整。
 - [ ] **P-E M5 常用** 👤  ケース装着・常用。
