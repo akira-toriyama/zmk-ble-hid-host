@@ -637,8 +637,12 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 		return;
 	}
 
-	/* Request 7.5ms (interval 6 x 1.25ms), latency 0, 4s timeout; peer may downgrade. */
-	struct bt_le_conn_param *cp = BT_LE_CONN_PARAM(6, 6, 0, 400);
+	/* Interval 7.5-15ms (6-12 x 1.25ms), latency 0, 5s supervision timeout.
+	 * A range (not a rigid 7.5ms) gives the peer/controller room to negotiate,
+	 * and the 5s timeout leaves more margin before a brief RX stall trips a
+	 * supervision-timeout disconnect (the RX-buffer fix above is the real cure;
+	 * this is headroom). latency stays 0 -- a mouse must not delay motion. */
+	struct bt_le_conn_param *cp = BT_LE_CONN_PARAM(6, 12, 0, 500);
 
 	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, cp, &default_conn);
 	if (err) {
