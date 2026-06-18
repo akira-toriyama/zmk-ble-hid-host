@@ -30,11 +30,14 @@
 
 LOG_MODULE_REGISTER(ble_hid_host, CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL);
 
-/* ZMK's input-listener consumes INPUT_BTN_0..4 (button index == code -
- * INPUT_BTN_0) -- 5 buttons, matching the standard mouse HID report. Buttons
- * beyond that are decoded but have no HID slot downstream, so we don't emit
- * them. */
-#define BLE_HID_HOST_PUBLISH_BTNS 5
+/* ZMK's input-listener maps INPUT_BTN_0..4 to the 5 standard mouse-HID buttons
+ * (button index == code - INPUT_BTN_0). We publish up to 8 so buttons 6..8 can
+ * still be remapped to a key/layer behavior via zmk,input-processor-behaviors,
+ * which consumes the event (ZMK_INPUT_PROC_STOP) before the mouse-HID path.
+ * Codes above INPUT_BTN_4 are ignored by that path if left unmapped, so emitting
+ * them is harmless; the 5-button mouse-HID cap (ZMK_HID_MOUSE_NUM_BUTTONS) only
+ * limits genuine mouse-button passthrough, not key/layer remap. */
+#define BLE_HID_HOST_PUBLISH_BTNS 8
 
 struct ble_hid_host_config {
     const char *device_name;
