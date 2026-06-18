@@ -167,7 +167,7 @@ static void report_work_handler(struct k_work *work)
 		}
 
 		if (zmk_hid_decode_report(&layout, evt.data, evt.len, &report) == 0) {
-			LOG_INF("report h=%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%04x",
+			LOG_DBG("report h=%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%04x",
 				evt.value_handle, report.dx, report.dy, report.wheel,
 				report.hwheel, (unsigned)report.buttons);
 			ble_hid_host_publish(host_dev, &report);
