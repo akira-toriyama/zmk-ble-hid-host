@@ -24,6 +24,30 @@ module = ZMK_BLE_HID_HOST
 module-str = ZMK BLE HID Host
 source "subsys/logging/Kconfig.template.log_config"
 
+# Wheel-axis -> key taps. The wheel is a signed axis (left/right and up/down
+# share one code, differing only by sign), which ZMK's stock code-only
+# input-processors cannot split. When enabled, this module converts each tick
+# into a tap of a distinct DPAD code so it can be remapped to a key/layer via
+# zmk,input-processor-behaviors. Default n keeps the module a generic scroll
+# source; the two axes are independent so you can key one and scroll the other.
+
+config ZMK_BLE_HID_HOST_HWHEEL_AS_KEYS
+    bool "Emit horizontal wheel (tilt) as DPAD_LEFT/RIGHT key taps"
+    default n
+    help
+      Convert each horizontal-wheel tick into a tap of INPUT_BTN_DPAD_LEFT
+      (tilt left) / INPUT_BTN_DPAD_RIGHT (tilt right) instead of an
+      INPUT_REL_HWHEEL scroll event. Repurposes the axis: horizontal scroll is
+      no longer emitted while enabled.
+
+config ZMK_BLE_HID_HOST_WHEEL_AS_KEYS
+    bool "Emit vertical wheel as DPAD_UP/DOWN key taps"
+    default n
+    help
+      Convert each vertical-wheel tick into a tap of INPUT_BTN_DPAD_UP (up) /
+      INPUT_BTN_DPAD_DOWN (down) instead of an INPUT_REL_WHEEL scroll event.
+      Repurposes the axis: vertical scroll is no longer emitted while enabled.
+
 # NOTE (M1): the BLE central / GATT-client requirements are NOT selected here
 # yet. They are documented in README.md and must be enabled in the consuming
 # zmk-config (CONFIG_BT_CENTRAL, CONFIG_BT_OBSERVER, CONFIG_BT_GATT_CLIENT,
