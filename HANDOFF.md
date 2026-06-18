@@ -47,7 +47,11 @@ xiao_ble 用に scan→接続→ボンド(Just Works/NIO)→全 HID input report
 - CI: `.github/workflows/probe-build.yml`（action-zephyr-setup, sdk 0.17.0, `west build -b xiao_ble .`）。
   成果物 `probe-uf2`。CI と Docker は**バイト同一**（500224B, 977 blocks）。
 - 焼く: XIAO リセット2回→ドライブ→`.uf2` D&D。ログ: `screen /dev/tty.usbmodem<XXXX> 115200`
-  （プローブの tty は location 名 `usbmodem21101` 等。USB serial 名では出ない場合あり）。
+  （プローブの tty は location 名 **`usbmodem21101`** 等。USB serial 名では出ない場合あり。
+  プローブの USB は Product=`XIAO HOGP Probe`/Vendor=`ZEPHYR` で `ioreg`/`system_profiler` から特定可）。
+- **Claude(別セッション含む)がこの Mac で採取する手順**: `screen` は対話的で不可。
+  `cat /dev/cu.usbmodem21101 > /tmp/p.log 2>&1 & CPID=$!; sleep 15; kill $CPID` の background+kill で数秒キャプチャ
+  →`sed -E 's/\x1b\[[0-9;]*m//g'` で ANSI 除去して読む（ポート open で起動時 DTR 待ち~10s が解除されログが流れる）。
 
 **実機結果（2026-06-18）**:
 - ✅ build/flash/boot/USB-log/BT有効/scan/**connect** まで全部実機で動作確認（こちらで `cat /dev/cu...` 採取）。
