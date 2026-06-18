@@ -337,3 +337,67 @@ dongle logs at the moment it dies (a disconnect with no following reconnect? a
 scan error? USB suspend with no resume?). The `report queue full` / motion lines
 are irrelevant here; the connect/disconnect/scanning INF lines are the signal.
 **Owner asked to tackle this AFTER the move-freeze root-cause hunt.**
+
+## 13. Root-cause hunt RESULT — soft throughput ceiling; FORCE_MD/2M/DLE ruled out (2026-06-18, no flash)
+
+Third multi-agent hunt (run `wf_16dcf436-7b0`), every claim source-verified and
+adversarially corrected. Goal: a ROOT-CAUSE fix beyond conn-param mitigation.
+
+**Confirmed root cause:** a single-threaded RX-node RECYCLE-THROUGHPUT ceiling. A
+controller RX node frees only after the host BT RX thread runs
+`bt_buf_get_rx(BT_BUF_ACL_IN, K_FOREVER)` (hci_driver.c:458) and the GATT path
+drains the matching host ACL net_buf; there is NO HCI flow control (combined
+`BT_LL_SW_SPLIT` build). When inbound PDU rate × per-PDU recycle latency exceeds
+what fits between connection anchor points, the pool drains to the 3-node ACK
+floor (lll_conn.c:1148) → NESN stall → 0x08. **No stock Kconfig knob raises the
+single-threaded recycle rate.**
+
+**RULED OUT (source-verified, do not pursue):**
+- **2M PHY** — already enabled + auto-negotiated (`BT_CTLR_PHY_2M=y`,
+  `BT_AUTO_PHY_UPDATE=y`, conn.c:1786). The recycle gate clears in CPU time (host
+  net_buf turnover), not on-air time, so halving air time does nothing. (Still
+  worth a `le_phy_updated` logger to CONFIRM the link is at 2M, not pinned to 1M.)
+- **DLE** — already maxed (`BT_CTLR_DATA_LENGTH_MAX=69`); each tiny notification is
+  its own PDU regardless.
+- **Pool depth** — already bumped (controller 15 / host 11), proven not the cure.
+- **FORCE_MD** — INERT here (all three verifiers). `FORCE_MD_CNT_SET()` only arms
+  when the central has `trx_cnt >= BT_BUF_ACL_TX_COUNT-1` (=7) ACL TX nodes in
+  flight (lll_conn.c:101-107, :1131); an RX-only HID host never reaches that → dead
+  code. The event already stays open on the peer's `md` bit anyway. Do NOT set it.
+
+**Real levers (can RAISE the ceiling / mitigate — none guaranteed):**
+1. **Subscription pruning → subscribe only to the motion report (id=2).** Host-side,
+   peer-INDEPENDENT cut to inbound PDU rate (rate scales time-to-freeze: 29/s→22s,
+   130/s→2.8s). EFFICACY is gated on whether the other 4 reports (ids 1/4/6/9)
+   actually notify DURING the flood — confirm on device (look for "ignoring report"
+   DBG during motion); if they are idle, pruning won't cut the motion flood. SAFETY
+   is fine: motion + buttons (incl. BTN_5/6=A/B) + wheel (tilt=C/D) are all decoded
+   from id=2, so pruning to id=2 preserves every used function.
+2. **Longer conn interval** (hog_central.c:654 `BT_LE_CONN_PARAM(6,12,…)` →
+   `(12,24,…)`): more host wall-clock per event to recycle. PEER-VETOABLE (the IST
+   PRO may pin 7.5 ms — confirm via `le_param_updated`). Keep timeout 500 in the
+   throughput test (don't shrink supervision margin in the same build — a longer
+   interval + shorter timeout on a marginal link could make the first post-reconnect
+   burst MORE likely to trip 0x08).
+3. **Shorter supervision timeout** — MITIGATION only (faster auto-reconnect, not
+   fewer drops). Apply separately, after the throughput experiment.
+4. **TX +8 dBm** (`BT_CTLR_TX_PWR_PLUS_8`) — marginal RF; only strengthens
+   dongle→mouse ACKs, not the inbound flood. Separate A/B run.
+
+**Honest verdict:** a soft ceiling = mouse motion rate vs single-threaded host
+recycle (RF a ~25-40% amplifier). Firmware can RAISE the ceiling (pruning /
+interval / TX-power+placement) and SHORTEN recovery (timeout), but cannot
+guarantee elimination at maximum aggressive motion without an architectural change
+(a separate RX-node drain thread, or HCI flow control / faster ACL path) that
+stock Kconfig does not expose. Likely outcome: strong mitigation, possibly
+freeze-free at normal motion rates, residual drops under extreme flood.
+
+**Recommended FIRST experiment (when device returns)** — ONE build:
+(1) interval `BT_LE_CONN_PARAM(12,24,0,500)`; (2) prune subscriptions to id=2;
+(3) `CONFIG_BT_USER_PHY_UPDATE=y` + a `.le_phy_updated` logger; keep
+`le_param_updated`. HOLD FORCE_MD (dead) and TX+8 dBm (separate A/B). Decision
+rule: PHY log tx2/rx2 ⇒ 2M ruled out; longer interval accepted + pruning ⇒
+time-to-freeze jumps ⇒ fixed/strongly mitigated; interval vetoed + pruning marginal
+⇒ architectural ceiling ⇒ mitigation-only (shorter timeout + antenna placement).
+
+Full output: run `wf_16dcf436-7b0` → `/private/tmp/.../tasks/wl6bscbo0.output`.
