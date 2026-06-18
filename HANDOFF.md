@@ -3,10 +3,13 @@
 > セッションをまたいで作業を継続するための正本。**未達成を暗黙にしない**。
 > 各セッション終了時にここを更新する。会話言語は日本語。
 
-最終更新: 2026-06-18（**M1 達成 ✅** ＋ **M2 デコード核 完了 ✅**: 純粋デコード（Report Map パーサ＋
-レポートデコーダ）を実装し、**実機採取の Report Map と実レポート16件**＋合成マウスで全部ホストテスト
-green。多エージェント敵対レビューで 12 件の指摘を修正済み。詳細は §M2。**M2 残＝`hog_central.c` 移植**
-（モジュール本体への組み込み）＋その検証ゲート＝**モジュール用ファームビルド CI**。次セッションの本丸は §4）
+最終更新: 2026-06-18（**M1 ✅ + M2 デコード核 ✅ + ファームビルド CI ✅ + hog_central 移植 ✅**。
+このセッションで M2 残を一気に解消: ① モジュール用ファームビルド CI を立てて **GitHub Actions で green**
+（`.uf2` 産出）＝M1-7 の最大関門クリア。② `hog_central.c` を probe から移植（scan→bond→discovery→
+**Report Map 読込+parse**→subscribe→**k_work 退避→decode→ログ**）。多エージェント敵対レビュー済み。
+**アーキ確定**: USB 出力専用＝`CONFIG_ZMK_BLE=n` で `BT_SMP_SC_PAIR_ONLY` の select を外し、レガシー
+Just Works を開通（実ビルドの `.config` で `# CONFIG_BT_SMP_SC_PAIR_ONLY is not set` を確認＝最大リスク消滅）。
+詳細 §M2b。**残るは M3 publish（decode→`input_report_*`＝カーソルが動く）のみ。設計は §4 に精密化。**）
 計画書: `/Users/tommy/.claude/plans/distributed-hatching-hejlsberg.md`
 元ブリーフ: `/Users/tommy/Downloads/zmk-ble-hid-host-brief.md`
 
@@ -135,6 +138,50 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
 （モジュール用ファームビルド CI が無く Zephyr ビルドで検証できないため、本 PR では純粋核＝ホスト検証済みのみに留めた）。
 → 次セッションで「ファームビルド CI（自己参照 west）→ CMake 有効化 → hog_central 移植 → M3 publish」。詳細 §4。
 
+## §M2b. ファームビルド CI ＋ HOGP central 移植（完了 ✅, 2026-06-18）
+
+**① モジュール用ファームビルド CI（M1-7 の最大関門）— GitHub Actions で green 実証**:
+- このリポジトリは ZMK ビルドで**二役**: (a) zmk-config（`config/west.yml` を `west init -l config` が読む）、
+  (b) Zephyr モジュール（`zephyr/module.yml` を reusable workflow が検出し `-DZMK_EXTRA_MODULES=<repo>` で注入）。
+- 追加物: `config/west.yml`（zmkfirmware/zmk の `app/west.yml` を import、`self.path: config`。**probe/west.yml は
+  生 Zephyr 用なので流用禁止**）／`build.yaml`（**リポジトリ root**。`build_matrix_path` 既定）／`.github/workflows/build.yml`
+  （`zmkfirmware/zmk/.github/workflows/build-user-config.yml@main` を呼ぶだけ）／`zephyr/module.yml` に **`board_root: .`** 追加。
+- **board は `xiao_ble/nrf52840/zmk`**（zmk@main の board variant＝`app/boards/seeed/xiao_ble/xiao_ble_zmk.dts`/`_defconfig`）。
+  **素の `xiao_ble` は生 Zephyr 用（probe の値）で ZMK ビルドでは誤り**。手本＝`akira-toriyama/canon`（ユーザのキーボード
+  config。`imprint_dongle` が同 board で green）。canon は ZMK に out-of-tree パッチを当てる自前 reusable を使うが、
+  本モジュールはパッチ非依存なので**公式 reusable でOK**。
+- 新規 shield `boards/shields/ble_hid_host_receiver/`: 物理キー無し dongle。`zmk,kscan-mock`（0 events、settings_reset と同手）で
+  必須の `zmk,kscan` chosen を満たし、`zmk,ble-hid-host` ノード＋`zmk,input-listener` を実体化。`.conf`/`.keymap`/`.zmk.yml`/Kconfig.*。
+- **ローカル検証**: probe と同じ Docker（`zmkfirmware/zmk-build-arm:stable`）で `west build -s zmk/app -b xiao_ble/nrf52840/zmk`。
+  CI と Docker 両方で `.uf2` 産出。`make` 不要、ホストに gcc 無くても可。
+
+**アーキ確定（USB 専用ドングル）— 最大リスク消滅**:
+- ZMK_BLE は `select BT_SMP_SC_PAIR_ONLY`（zmk `app/Kconfig:151`）→ ZMK_BLE=y だと LE Secure 必須で **IST PRO（レガシー専用）と
+  central bond 不能**。回避＝shield `.conf` で **`CONFIG_ZMK_BLE=n`＋`CONFIG_ZMK_USB=y`**（settings_reset が ZMK_BLE=n を実証済の手）。
+- 結果、本モジュールが **BT スタックを自前所有**（`bt_enable`/`settings_load` を自分で呼ぶ＝probe と同じ）。実ビルドの `.config` で
+  `# CONFIG_BT_SMP_SC_PAIR_ONLY is not set` / `# CONFIG_ZMK_BLE is not set` / `CONFIG_BT_CENTRAL=y` を確認。**蒸し返さない。**
+- ユーザは PC に XIAO を2台接続（本トラックボール受信器＋canon キーボード dongle）。両方 USB・独立。**本機の最終配置も USB 出力**。
+  → M4 の「自己完結 config か canon 統合か」は **自己完結（canon に触らない）で確定**。
+
+**② `hog_central.c` 移植（probe → モジュール、§M1 作法を踏襲）**:
+- `drivers/input/{hog_central.c,hog_central.h}` 新規。`ble_hid_host.c` init が `zmk_ble_hid_host_central_start(dev, device_name)` を呼ぶ。
+- probe からほぼ逐語移植: scan→`device_found`（appearance==mouse か IST/ELECOM 名、または `device-name` 完全一致）→`bt_conn_le_create`
+  (7.5ms)→`connected`→`bt_conn_set_security(L2)`→`security_changed` で discovery→PRIMARY HIDS→**Report Map(0x2A4B) read+`zmk_hid_parse_report_map`**
+  →Report chrc(0x2A4D notifiable)→CCC(0x2902) per-report subscribe（各 `sub_params` は static 長寿命）。auth は `.cancel` のみ＝NIO Just Works。
+- **新規追加**: Report Map を `bt_gatt_read`（read-long、512B バッファ）→ parse して `layout` 確定。`notify_cb` は BT RX 文脈なので
+  `k_msgq`+`k_work` で退避し、work handler で `zmk_hid_decode_report`→**M2 はログのみ**（`report h=.. dx=.. dy=.. wheel=.. buttons=..`）。
+- BT bring-up は device init（POST_KERNEL）から `k_work_delayable` で 500ms 遅延（flash/settings 準備待ち）。`CONFIG_BT_CENTRAL` でガード
+  （無効時は no-op stub＝INPUT のみビルドもリンク可）。
+- **敵対レビュー（4観点+triage）反映**: ① disconnect で `layout_valid`+`rm_len` リセット（再接続で stale layout デコード防止＝唯一の実バグ）。
+  ② report-map discover 同期エラーで `disc_state=IDLE`。③ Report Map 512B 超過で LOG_WRN。④ layout の cross-workqueue アクセスを
+  コメント明記（M2 良性、M3 publish 前に atomic 化）。「無限ループ/overread」指摘は zephyr gatt.c 照合で **false positive 確定**。
+
+**検証用 logging variant**: `build.yaml` に `-DCONFIG_ZMK_USB_LOGGING=y`（artifact `..._logging`）を追加。`CONFIG_USB_CDC_ACM=y` が入り、
+ユーザが **`cat /dev/cu.usbmodem<XXX>`** で connect/bond/discover/decode のログを M1 と同様に採取できる（M3 前の実機検証用）。
+
+**現状の到達**: モジュールが「BLE 受信→Report Map 解析→デコード→**ログ**」する `.uf2` が CI/Docker で green。**カーソルはまだ動かない**
+（M2＝ログのみ、publish は M3）。残りは §4 の M3 のみ。
+
 ## 2. 完了（M0）＝ 検証済み
 
 - リポジトリ雛形（`driver` 型 Zephyr module）。ZMK 同梱の `app/module` 慣習に準拠。
@@ -154,15 +201,14 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
 
 ## 3. 未達成・未検証（暗黙にしない）
 
-- [ ] **モジュール用ファームの実ビルド未実施（最重要の次の一手）**。probe は CI/Docker で `.uf2` をビルド済みだが、
-      **ZMK モジュール本体**（app=zmk + config + module の自己参照 west）の `west build` / GH Actions は**まだ通していない**。
-      → 次セッションでファームビルド CI を立てて green に（§4 手順①）。これが全 Zephyr 側コードの検証ゲート。
-- [x] **BLE 受信(M1) ✅実機実証**（§M1）／ **デコード(M2核) ✅ホスト検証**（§M2）。
-- [ ] **M2残＝`hog_central.c`（モジュールへの HOGP 移植）・publish(M3)・配線(M4) は未実装**（§4）。
-      `drivers/input/CMakeLists.txt` の parser/decoder/hog_central 行はまだコメント（ファームビルド CI 待ち）。
-- [ ] **M3 実機検証ゼロ**（カーソルが動くか）。XIAO・IST PRO は tommy さん手元にあり実機作業は可能（2026-06-18 確認）→ §6 P-C。
-- [ ] `config-example/zmk-config.conf.snippet` の Kconfig 一式は名前を Zephyr 4.1 で確認済みだが、
-      **同時有効化でビルドが通るかは未検証**（§4 手順①のファームビルドで確定する）。
+- [x] **モジュール用ファームの実ビルド ✅完了**（§M2b）。自己参照 west の ZMK ファーム（app=zmk+config+module）が
+      **GitHub Actions で green**＋ローカル Docker でも `.uf2` 産出。board=`xiao_ble/nrf52840/zmk`。全 Zephyr 側コードの検証ゲート確立。
+- [x] **BLE 受信(M1) ✅実機実証**（§M1）／ **デコード(M2核) ✅ホスト検証**（§M2）／ **`hog_central.c` 移植 ✅ビルド green**（§M2b）。
+      `drivers/input/CMakeLists.txt` の parser/decoder/hog_central は**全て有効化済み**。
+- [ ] **M3 publish 未実装＝唯一の残り**（decode→`input_report_*`）。現状はデコード結果を**ログ出力のみ**（カーソルは動かない）。設計 §4。
+- [ ] **実機検証は未**: ①M2 受信/デコードが実機で動くか（logging variant を焼いて `cat` でログ確認＝P-B' 推奨）、
+      ②M3 でカーソルが動くか（§6 P-C）。XIAO・IST PRO は tommy さん手元にあり実機作業可（2026-06-18 確認）。
+- [x] `.conf` の Kconfig 同時有効化でビルドが通ることを**確認済み**（§M2b の実ビルド `.config`）。
 
 ## 4. 次にやること
 
@@ -182,32 +228,45 @@ M2 の中核＝**Zephyr 非依存の純粋デコード**を実装し、ホスト
 - **③の置き場所＝M4 の分岐**: 自己完結ドングル config か、ユーザの `akira-toriyama/canon`(Cyboard Imprint)に統合か。
   ①②を出すだけなら **専用ドングル ZMK ビルドが最短**。canon は M4 まで触らない（§1 方針）。
 
-### ▶ 次セッション = M2残 + M3（カーソルが動く所まで）
+### ▶ 次セッション = M3 publish（カーソルが動く）＝ 唯一の残り
 
-**M2 デコード核は完了済み（§M2, `feat/m2-decode`）。** 残りは「実機で効く」ための配線。推奨実行順:
+ファームビルド CI・decode 有効化・`hog_central.c` 移植は**完了済み（§M2b, ブランチ `feat/m2-firmware-build`）**。
+今のファームは「受信→デコード→**ログ**」まで。残りは decode 結果を input subsystem に publish するだけ。
 
-1. **モジュール用ファームビルド CI（最重要・全 Zephyr 側コードの検証ゲート）**。M1-7 からの持ち越し＝
-   「自己参照 west」が要詰めポイント。`config/west.yml`（zmkfirmware/zmk を import ＋ self でこのモジュール）
-   ＋ `build.yaml`（`seeeduino_xiao_ble` ＋ `zmk,ble-hid-host` ノードを持つ最小 shield/keymap）を用意し、
-   ZMK の reusable build workflow で `.uf2` を出す。push→`gh run`→green まで反復。
-   - これが green になって初めて Zephyr 側（hog_central / モジュール組込み）が検証可能＝**焼ける .uf2 が出る**。
-   - probe(`probe/west.yml`)が「app=manifest repo」レイアウトの動く手本。ただしあれは標準 Zephyr アプリ、
-     こちらは ZMK ファーム（app=zmk + config + module）なので構成が違う。ZMK module CI（cirque-input-module 等）参照。
-2. **`drivers/input/CMakeLists.txt` のコメント行を有効化**（hog_central.c / hid_report_parser.c / hid_report_decode.c）。
-   ①の CI でビルドが通ることを確認。
-3. **`hog_central.c` 移植**: `probe/src/main.c` の HOGP ロジック（scan→connect→**security_changed で discovery**→
-   subscribe）を移植。M1 の「HOGP ホスト作法」(§M1)が移植元。各 subscribe params は個別 long-lived。
-   Report Map characteristic(0x2A4B)を read→`zmk_hid_parse_report_map`→layout 確定。
-   notify で生ペイロード→`zmk_hid_decode_report`→（M2段階ではログ／M3で publish）。
-   コールバックは BT スタック文脈なので重い処理は `k_work`/`k_msgq` で遅延（central.c 手本）。
-4. **M3 = publish（カーソルが実際に動く）**: `ble_hid_host.c` の「M3 publish contract」コメントを実装。
-   decoded → `input_report_rel(REL_X/Y/WHEEL/HWHEEL)` ＋ボタンは前回マスクとの差分エッジで `input_report_key`、
-   最後の event に `sync=true`。①の shield/keymap に input-listener を付けて実機でカーソル移動を確認（P-C）。
+**0. （推奨・着手前）M2 を実機で先に確認**: logging variant `.uf2`（CI artifact `ble_hid_host_receiver-logging` か
+   ローカル `build-log/zephyr/zmk.uf2`）を XIAO に焼き、IST PRO を繋ぎ、`cat /dev/cu.usbmodem<XXX>` で
+   `connected`→`secured`→`report map parsed`→`report h=.. dx=.. dy=..` が出るか確認（§M1 の採取手順流用）。
+   これで「BLE 受信〜デコード」が実機で正しいと確定してから M3 に入ると手戻りが無い。**watch すべき**: ①重複通知
+   （出たら `BT_GATT_SUBSCRIBE_FLAG_NO_RESUB` を検討）、②`report queue full; dropping`（出たら msgq 深さ増 or 退避見直し）。
 
-DoD: ①ファームビルド CI green（.uf2 産出）＋ ②③④ 実装 → tommy さんが焼いて「カーソルが動く」を実機確認。
-ブランチ案: `feat/m2-firmware-build`（①②）→ `feat/m3-publish`（③④）など分割可。push は自由（§8）。
+**1. Report Reference (0x2908) で report-ID マッチング（publish の前提）**: 今は全 notifiable report をデコードして
+   いる（M2 ログでは無害）。publish では**ポインタ report だけ**を motion 化しないと、キーボード/コンシューマ report が
+   ゴミ移動になる。`hog_central.c` の discovery で各 report char の Report Reference 記述子(0x2908)を read して
+   `report_id` を得て、`sub_params` に併存させる（`struct { struct bt_gatt_subscribe_params params; uint8_t report_id; }`
+   にして `notify_cb` で `CONTAINER_OF`）。work handler は `report_id == layout.report_id` の時だけ publish。
+   実装: subscribe_pending を「0x2908 を discover→read で report_id 取得→0x2902(CCC) discover→subscribe」に拡張
+   （uuid=NULL で記述子一括 discover し 0x2902/0x2908 を仕分ける手もある）。
 
-旧メモ（参考・上記に統合済み）: テスト期待値は `ist_pro.live_reports.hex` のコメントがそのまま正解表。
+**2. publish 実装（`ble_hid_host.c`）**: 既存コメント「M3 publish contract」(行 40-51)を実装。
+   `ble_hid_host_publish(const struct device *dev, const struct zmk_hid_pointer_report *r)` を公開し、hog_central の
+   work handler（`report_work_handler`）の `/* M3: ble_hid_host_publish(host_dev, &report); */` から呼ぶ。本体:
+   - **ボタン**: `ble_hid_host_data` に `uint32_t prev_buttons` を追加。`r->buttons ^ prev_buttons` の変化ビット i ごとに
+     `input_report_key(dev, INPUT_BTN_0+i, (r->buttons>>i)&1, false, K_NO_WAIT)`。**`INPUT_BTN_0/1/2`(0x100..) を使う**
+     （`input_listener.c` は `INPUT_BTN_0..4`+`TOUCH` を消費。`INPUT_BTN_LEFT/RIGHT`(0x110..) ではない）。最後に `prev_buttons=r->buttons`。
+   - **移動**: dx/dy/hwheel が非0なら `input_report_rel(dev, INPUT_REL_X/Y/HWHEEL, 値, false, K_NO_WAIT)`。
+   - **sync**: 終端 event を `input_report_rel(dev, INPUT_REL_WHEEL, r->wheel, true, K_NO_WAIT)`（wheel==0 でも sync=true で listener を flush）。
+   - `CONFIG_ZMK_POINTING=y`（既に有効）で ZMK core が REL/BTN を mouse HID 化して USB 出力。listener+device は shield overlay に配線済み。
+   - **layout を atomic 化**（§M2b の deferred）: publish 前に layout を atomic publish か double-buffer swap にし、
+     注入する delta が half-written layout 由来にならないようにする。
+
+**3. ビルド→実機**: ローカル Docker で green 確認→push→CI green。default `.uf2` を XIAO（トラックボール用の方）に
+   物理ダブルタップで焼く→IST PRO 接続→**カーソルが動く**（P-C 達成）。軸反転/scaling 等は keymap の input-processors（§M1 参考、`ist_pro.keymap.snippet`）。
+
+DoD: M3 publish 実装→ビルド green→tommy さんが焼いて「カーソルが動く」を実機確認（P-C）。
+ブランチ案: 現 `feat/m2-firmware-build` に重ねるか `feat/m3-publish` を分岐。push 認可済み（§8 ＋ 2026-06-18 セッションで明示再確認）。
+
+参考: デコード期待値の正解表は `tests/parser/fixtures/ist_pro.live_reports.hex` のコメント。`input_report_rel` 署名は
+`input_report_rel(dev, code, value, sync, k_timeout_t)`（§8 検証済）。input コード値: `INPUT_REL_X`=0x00 `Y`=0x01 `HWHEEL`=0x06 `WHEEL`=0x08、`INPUT_BTN_0`=0x100。
 
 手本（ローカル checkout、行番号は変わり得るので関数名で追う）:
 - `…/zmk/app/src/split/bluetooth/central.c` … scan→connect→discover→subscribe の状態機械の正本。
@@ -288,8 +347,17 @@ M1 のサブステップ:
 # ホスト単体テスト（実機/Zephyr 不要）
 make -C tests/parser test          # → "all host tests passed"
 
-# CI 状況
+# CI 状況（host-tests / probe-build / "Build ZMK firmware"）
 gh run list -R akira-toriyama/zmk-ble-hid-host
+
+# ファームをローカル Docker でビルド（CI と同等、push 不要で検証可）
+#   WS=任意の scratch（repo を汚さない）。初回 build-in-container.sh が
+#   west init -l config → west update → west build。以後は incremental。
+WS=/Volumes/workspace/.zmk-blehh-build      # このセッションで使った場所
+docker run --rm -v <repo>:/repo:ro -v "$WS":/ws -w /ws \
+  zmkfirmware/zmk-build-arm:stable bash /ws/rebuild-in-container.sh
+#   → /ws/build/zephyr/zmk.uf2（fresh build dir は `west zephyr-export` を先に）
+#   board は xiao_ble/nrf52840/zmk、SHIELD=ble_hid_host_receiver。
 ```
 
 ## 10. 参考パス（ローカル checkout）
