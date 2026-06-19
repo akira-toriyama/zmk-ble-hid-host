@@ -5,7 +5,13 @@
 > NO firmware cure (see `investigation-reconnect-freeze.md` §15). FIX-B does **not**
 > stop the drops; it makes each freeze **shorter and faster-recovering** by lowering
 > the supervision timeout so the already-working auto-reconnect fires sooner.
-> **Status:** PLANNED, not implemented. **Date:** 2026-06-19.
+> **Status:** ❌ IMPLEMENTED + FLASHED + TESTED ON-DEVICE → **DEAD END** (2026-06-19).
+> Both phases work as designed (Phase-1 central update applies non-vetoed; Phase-2
+> clamp holds 1200 ms), but the IST PRO re-requests 2160 ms every ~400 ms (435 clamps
+> in one capture = churn) and drops became MORE frequent (~5-8 s vs ~6-13 s baseline).
+> Not fixed, arguably worse. Code preserved on branch `experiment/fix-b-supervision-
+> timeout` (NOT merged). See investigation §16. Plan kept for the record / a possible
+> future non-IST-PRO peer. **Date:** 2026-06-19.
 
 ---
 

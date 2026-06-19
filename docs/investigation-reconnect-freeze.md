@@ -448,6 +448,46 @@ time-to-freeze jumps ⇒ fixed/strongly mitigated; interval vetoed + pruning mar
 
 Full output: run `wf_16dcf436-7b0` → `/private/tmp/.../tasks/wl6bscbo0.output`.
 
+## 16. FIX-B tried ON-DEVICE — DEAD END (2026-06-19)
+
+The §15d / plan-doc mitigation (`docs/plan-fix-b-supervision-timeout.md`) was
+implemented and flashed to the device in two phases. Result: **conn-param
+mitigation does not deliver a usable improvement on the IST PRO — confirmed on
+hardware.** Code preserved on branch `experiment/fix-b-supervision-timeout` (NOT
+merged).
+
+**Phase 1 — central-forced `bt_conn_le_param_update(1200 ms)` at discovery-done +700 ms:**
+- The central update is **non-vetoable and APPLIES** (proof: `conn params updated:
+  ... timeout 1200 ms` logged) — refutes the earlier "peer may reject it" worry.
+- BUT the IST PRO **re-requests its 2160 ms ~400 ms later**, which Zephyr (no
+  `le_param_req`) auto-accepts → reverts. Net: timeout is 2160 ms almost always →
+  no improvement. (Capture: `/tmp/fixb.log` — per cycle: 2160 → 1200 → 2160.)
+
+**Phase 2 — add `le_param_req` that clamps the peer's timeout down to 1200 ms:**
+- The clamp **holds** the applied timeout at 1200 ms (never reverts to 2160 ms).
+- BUT the peer re-requests 2160 ms **relentlessly, every ~400 ms** → the clamp fired
+  **435 times in one capture** = constant LLCP connection-update churn (~11 % of
+  airtime at 7.5 ms interval).
+- 0x08 drops became **MORE frequent (~5-8 s apart)** than the RX-12/10 baseline
+  (~6-13 s) — exactly the §11 prediction "shorter timeout ⇒ shorter but MORE
+  FREQUENT drops." Each recovery is shorter (~1.9 s incl. reconnect) but they happen
+  more often, plus the churn. **Net user experience: not fixed, arguably worse.**
+  (Capture: `/tmp/fixb2.log`.)
+
+**VERDICT (now confirmed on hardware, not just by analysis): every firmware lever —
+including the last-resort conn-param mitigation — is exhausted. The move-freeze
+under hard aggressive motion is a hard architectural ceiling (single-threaded RX
+recycle gated by `ull_pdu_rx_alloc_peek(3)`, no HCI flow control; the IST PRO
+aggressively maintains its own 2160 ms and fights any change). The only remaining
+lever is non-firmware: RF link quality (dongle↔mouse distance, USB3 / 2.4 GHz
+interference, antenna placement, TX +8 dBm).** Firmware best-known state =
+RX 12/10 (idle rock-solid, permanent wedge gone); ship that, accept the residual.
+
+Rollback firmware (restore the clean pre-FIX-B device):
+`/Volumes/workspace/.zmk-blehh-build/rollback/abcd_rx12_reverted_logging.uf2`
+(RX 12/10 + §14 interval revert + logging, no FIX-B). FIX-B builds kept as
+`fixb_1200ms_logging.uf2` / `fixb_phase2_clamp_logging.uf2` (do NOT use for daily).
+
 ## 14. Interval experiment RESULT — VETOED by the peer; mouse params revealed (2026-06-19)
 
 On-device test of §13's first experiment (interval widened to 15-30 ms + a PHY
