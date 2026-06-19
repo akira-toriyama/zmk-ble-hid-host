@@ -36,8 +36,9 @@ M4 features). Not yet merged; rebase rewrote history so a push needs
 > flashed + tested → **DEAD END** (peer fights it relentlessly, drops got more
 > frequent — §16); and maxing the RX pool to 18/20 was flashed + tested → **NO
 > benefit** (§17). The freeze is a confirmed hardware ceiling. **Shipped firmware =
-> RX 18/20** (per user choice; behaves identically to 12/10 for the freeze, just max
-> burst headroom). **Only mitigations are non-firmware:** behavioral (wait ~2-3 s
+> RX 12/10** (the documented baseline; RX 18/20 was tested and is interchangeable,
+> so 12/10 is kept — the device is flashed RX 12/10). **Only mitigations are
+> non-firmware:** behavioral (wait ~2-3 s
 > after power-on before flailing; keep the link up) + RF (user confirmed already
 > optimal). Full analysis: **§15** (no-cure verdict), **§16** (FIX-B), **§17** (RX-18).
 >
@@ -667,10 +668,11 @@ flashed (logging combo), and run against the immediate-aggressive-move repro.
 
 **Confirms §9/§13 exactly:** deeper pools raise BURST absorption only marginally and
 do **not** move the freeze; the steady-state RX-node recycle ceiling dominates even
-the immediate-burst case. **DECISION (user preference): KEEP RX 18/20.** It has no
-measured benefit over 12/10 for the freeze, but no downside either (~3 KB more RAM,
-max burst headroom), so the `.conf` is set to 18/20 to match the flashed device
-(`rollback/rx18_logging.uf2`). 12/10 and 18/20 are interchangeable for this freeze.
+the immediate-burst case. **DECISION: keep RX 12/10** (the documented baseline). RX
+18/20 was tested with no measured benefit (and no downside), so there is no reason to
+deviate; `.conf` stays 12/10 and the device was flashed back to RX 12/10
+(`abcd_rx12_reverted_logging.uf2`). 12/10 and 18/20 are interchangeable for this
+freeze; the RX-18 build is kept as `rollback/rx18_logging.uf2`.
 
 **FINAL on-device tally — every firmware lever is now exhausted on hardware:** RX
 depth (incl. max 18), thread-starvation (refuted), 2M/DLE/FORCE_MD, conn-interval
@@ -678,4 +680,4 @@ depth (incl. max 18), thread-starvation (refuted), 2M/DLE/FORCE_MD, conn-interva
 (peer fights, §16). **The move-freeze under hard aggressive motion is a hardware
 ceiling — not fixable in stock firmware, period.** Only mitigations: behavioral
 (wait ~2-3 s after power-on before flailing; keep the link up — don't power-cycle the
-mouse often) + RF (already optimal here). Shipped firmware = RX 18/20 (per user choice; identical freeze behavior to 12/10).
+mouse often) + RF (already optimal here). Shipped firmware = RX 12/10 (the documented baseline; RX 18/20 is interchangeable).
