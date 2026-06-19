@@ -26,6 +26,10 @@ extern "C" {
 /** Maximum number of mouse buttons we track in a decoded report. */
 #define ZMK_HID_MAX_BUTTONS 16
 
+/** Maximum number of simultaneously-held keycodes we decode from an array
+ *  report (boot/6KRO keyboards report 6; allow headroom for larger arrays). */
+#define ZMK_HID_MAX_KEYS 16
+
 /**
  * A decoded pointer report.
  *
@@ -38,6 +42,20 @@ struct zmk_hid_pointer_report {
     int32_t wheel;
     int32_t hwheel;
     uint32_t buttons;
+};
+
+/**
+ * A decoded keyboard report.
+ *
+ * modifiers is a bitmask of the eight modifier keys (bit i == HID usage 0xE0+i:
+ * bit0 Left Ctrl .. bit7 Right GUI). keys[] holds the non-zero HID keycodes
+ * currently reported in the keycode array, key_count of them (0x00 slots and
+ * 0x01 ErrorRollOver are dropped by the decoder).
+ */
+struct zmk_hid_keyboard_report {
+    uint8_t modifiers;
+    uint8_t keys[ZMK_HID_MAX_KEYS];
+    uint8_t key_count;
 };
 
 /**
@@ -71,6 +89,21 @@ struct zmk_hid_report_layout {
     struct zmk_hid_field buttons; /**< Contiguous button bitfield. */
     uint8_t button_count;
     bool valid;                   /**< true once a usable pointer layout is found. */
+};
+
+/**
+ * Where the keyboard fields live in a peer's input report, derived from its HID
+ * Report Map. A standard boot-style keyboard reports an 8-bit modifier
+ * bitfield, a reserved byte, then a keycode Array (6 bytes for 6KRO). NKRO
+ * bitmap reports are not modeled yet (the modifier + array form is).
+ */
+struct zmk_hid_keyboard_layout {
+    uint8_t report_id;              /**< Report ID this layout describes (0 == none). */
+    struct zmk_hid_field modifiers; /**< Contiguous modifier bitfield (usages 0xE0-0xE7). */
+    struct zmk_hid_field keys;      /**< Keycode Array: bit_offset == first entry,
+                                     *   bit_size == per-entry width (8 for a standard kbd). */
+    uint8_t key_count;              /**< Number of entries in the keycode array. */
+    bool valid;                     /**< true once a usable keyboard layout is found. */
 };
 
 /**
@@ -108,6 +141,40 @@ int zmk_hid_parse_report_map(const uint8_t *report_map, size_t len,
 int zmk_hid_decode_report(const struct zmk_hid_report_layout *layout,
                           const uint8_t *report, size_t len,
                           struct zmk_hid_pointer_report *out);
+
+/**
+ * Parse a HID Report Map into a keyboard-report layout.
+ *
+ * Walks the same report-descriptor item stream as zmk_hid_parse_report_map() but
+ * records the modifier bitfield and keycode Array of the first usable keyboard
+ * (Generic Desktop / Keyboard application) collection.
+ *
+ * @param report_map  Raw bytes of the HID Report Map characteristic.
+ * @param len         Length of @p report_map in bytes.
+ * @param out         Output layout; out->valid indicates success.
+ * @return 0 on success, negative on parse error / no keyboard found.
+ *
+ * Pure function (no Zephyr deps). NKRO bitmap reports are not modeled yet.
+ */
+int zmk_hid_parse_keyboard_report_map(const uint8_t *report_map, size_t len,
+                                      struct zmk_hid_keyboard_layout *out);
+
+/**
+ * Decode one raw keyboard input report using a parsed keyboard layout.
+ *
+ * @param layout  Layout produced by zmk_hid_parse_keyboard_report_map().
+ * @param report  Raw HOGP input-report notification payload (no leading
+ *                report-ID byte -- see struct zmk_hid_field).
+ * @param len     Length of @p report in bytes.
+ * @param out     Decoded keyboard report.
+ * @return 0 on success, negative if the layout is invalid or @p report is
+ *         shorter than the layout requires.
+ *
+ * Pure function (no Zephyr deps).
+ */
+int zmk_hid_decode_keyboard_report(const struct zmk_hid_keyboard_layout *layout,
+                                   const uint8_t *report, size_t len,
+                                   struct zmk_hid_keyboard_report *out);
 
 #ifdef __cplusplus
 }

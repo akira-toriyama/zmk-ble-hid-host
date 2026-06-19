@@ -368,6 +368,156 @@ static void test_boot_mouse(void) {
     check_decode(200, &r, &want);
 }
 
+/* ───────────────────────── keyboard assertions ─────────────────────────── */
+struct kexpect {
+    uint8_t modifiers;
+    uint8_t keys[ZMK_HID_MAX_KEYS];
+    uint8_t key_count;
+};
+
+static void check_kbd_decode(int idx, const struct zmk_hid_keyboard_report *r,
+                             const struct kexpect *e) {
+    int ok = (r->modifiers == e->modifiers && r->key_count == e->key_count);
+    for (uint8_t i = 0; ok && i < e->key_count; i++) {
+        if (r->keys[i] != e->keys[i]) {
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        printf("FAIL kbd[%d]: got {mod=0x%02x n=%u k=[%02x %02x %02x]} "
+               "want {mod=0x%02x n=%u k=[%02x %02x %02x]}\n",
+               idx, r->modifiers, r->key_count, r->keys[0], r->keys[1], r->keys[2],
+               e->modifiers, e->key_count, e->keys[0], e->keys[1], e->keys[2]);
+        failures++;
+    }
+}
+
+/* A standard boot-style keyboard report map: 8-bit modifier bitfield, a
+ * reserved byte, then a 6-entry keycode Array. Optionally report-ID'd. */
+static void make_boot_keyboard_map(uint8_t *m, size_t *len, int with_report_id) {
+    static const uint8_t head_id[] = {
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, /* GD/Keyboard, Collection(App), Report ID 1 */
+    };
+    static const uint8_t head_noid[] = {
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01,             /* GD/Keyboard, Collection(App)              */
+    };
+    static const uint8_t body[] = {
+        0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,             /*   Keyboard page, Usage Min/Max 0xE0..0xE7 */
+        0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, /*   logical 0..1, size 1, count 8           */
+        0x81, 0x02,                                     /*   Input (Data,Var,Abs) modifier byte      */
+        0x95, 0x01, 0x75, 0x08, 0x81, 0x03,             /*   Input (Const) reserved byte             */
+        0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, /*   count 6, size 8, logical 0..101         */
+        0x05, 0x07, 0x19, 0x00, 0x29, 0x65,             /*   Keyboard page, Usage Min/Max 0x00..0x65 */
+        0x81, 0x00,                                     /*   Input (Data,Array) keycode array        */
+        0xc0,                                           /* End Collection                            */
+    };
+    size_t n = 0;
+    const uint8_t *head = with_report_id ? head_id : head_noid;
+    size_t hlen = with_report_id ? sizeof(head_id) : sizeof(head_noid);
+    memcpy(m + n, head, hlen);
+    n += hlen;
+    memcpy(m + n, body, sizeof(body));
+    n += sizeof(body);
+    *len = n;
+}
+
+/* ───────────────── M2+: synthetic boot keyboard (no report ID) ──────────── */
+static void test_boot_keyboard(void) {
+    uint8_t map[128];
+    size_t maplen;
+    make_boot_keyboard_map(map, &maplen, 0);
+
+    struct zmk_hid_keyboard_layout l;
+    CHECK(zmk_hid_parse_keyboard_report_map(map, maplen, &l) == 0);
+    CHECK(l.valid);
+    CHECK(l.report_id == 0); /* no Report ID item */
+    check_field("kbd modifiers", &l.modifiers, 0, 8, false);
+    check_field("kbd keys", &l.keys, 16, 8, false);
+    CHECK(l.key_count == 6);
+
+    /* HOGP payload: no report-ID byte. byte0 modifiers, byte1 reserved, 2..7 keys. */
+    struct {
+        const char *name;
+        uint8_t payload[8];
+        struct kexpect want;
+    } cases[] = {
+        {"LeftShift+a", {0x02, 0x00, 0x04, 0, 0, 0, 0, 0}, {.modifiers = 0x02, .keys = {0x04}, .key_count = 1}},
+        {"LCtrl+LShift+a+b", {0x03, 0x00, 0x04, 0x05, 0, 0, 0, 0}, {.modifiers = 0x03, .keys = {0x04, 0x05}, .key_count = 2}},
+        {"idle", {0, 0, 0, 0, 0, 0, 0, 0}, {.modifiers = 0, .key_count = 0}},
+        {"drop 0x00/ErrorRollOver", {0x00, 0x00, 0x01, 0x04, 0, 0, 0, 0}, {.modifiers = 0, .keys = {0x04}, .key_count = 1}},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct zmk_hid_keyboard_report r;
+        CHECK(zmk_hid_decode_keyboard_report(&l, cases[i].payload, 8, &r) == 0);
+        check_kbd_decode((int)(300 + i), &r, &cases[i].want);
+    }
+
+    /* Too-short payload must be rejected (layout needs 8 bytes). */
+    uint8_t tiny[] = {0x02, 0x00, 0x04};
+    struct zmk_hid_keyboard_report r;
+    CHECK(zmk_hid_decode_keyboard_report(&l, tiny, sizeof(tiny), &r) != 0);
+}
+
+/* ───────────── M2+: report-ID'd keyboard parses the ID from the map ─────── */
+static void test_keyboard_with_report_id(void) {
+    uint8_t map[128];
+    size_t maplen;
+    make_boot_keyboard_map(map, &maplen, 1);
+
+    struct zmk_hid_keyboard_layout l;
+    CHECK(zmk_hid_parse_keyboard_report_map(map, maplen, &l) == 0);
+    CHECK(l.valid);
+    CHECK(l.report_id == 1); /* parsed from the map; NOT present in the payload */
+    /* The report-ID item resets the bit cursor, so field offsets are unchanged. */
+    check_field("kbd(id) modifiers", &l.modifiers, 0, 8, false);
+    check_field("kbd(id) keys", &l.keys, 16, 8, false);
+    CHECK(l.key_count == 6);
+
+    uint8_t payload[] = {0x02, 0x00, 0x04, 0, 0, 0, 0, 0}; /* no leading ID byte */
+    struct zmk_hid_keyboard_report r;
+    CHECK(zmk_hid_decode_keyboard_report(&l, payload, sizeof(payload), &r) == 0);
+    struct kexpect want = {.modifiers = 0x02, .keys = {0x04}, .key_count = 1};
+    check_kbd_decode(310, &r, &want);
+}
+
+/* ─── M2+: composite-device parsing + class discrimination (real hardware) ─ */
+static void test_composite_and_discrimination(void) {
+    /* The IST PRO is a COMPOSITE device: its Report Map carries a Mouse
+     * collection (report 2) AND a Keyboard collection (report 1, the
+     * programmable buttons -- 8 modifiers + a 6-key array). Each parser pulls
+     * out its own class from the SAME map. */
+    uint8_t ist[512];
+    size_t ilen = load_hex_blob("ist_pro.report_map.hex", ist, sizeof(ist));
+
+    struct zmk_hid_report_layout pl;
+    CHECK(zmk_hid_parse_report_map(ist, ilen, &pl) == 0);
+    CHECK(pl.valid && pl.report_id == 2);
+
+    struct zmk_hid_keyboard_layout kl;
+    CHECK(zmk_hid_parse_keyboard_report_map(ist, ilen, &kl) == 0);
+    CHECK(kl.valid && kl.report_id == 1);
+    check_field("ist kbd modifiers", &kl.modifiers, 0, 8, false);
+    CHECK(kl.keys.bit_size == 8 && kl.key_count == 6);
+
+    /* A keyboard-only map yields a keyboard but NO pointer. */
+    uint8_t kbd[128];
+    size_t klen;
+    make_boot_keyboard_map(kbd, &klen, 0);
+    struct zmk_hid_report_layout pl2;
+    CHECK(zmk_hid_parse_report_map(kbd, klen, &pl2) == -1 && !pl2.valid);
+
+    /* A pointer-only map (synthetic boot mouse) yields a pointer but NO keyboard. */
+    static const uint8_t mouse[] = {
+        0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00,
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
+        0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03,
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7f,
+        0x75, 0x08, 0x95, 0x02, 0x81, 0x06, 0xc0, 0xc0,
+    };
+    struct zmk_hid_keyboard_layout kl2;
+    CHECK(zmk_hid_parse_keyboard_report_map(mouse, sizeof(mouse), &kl2) == -1 && !kl2.valid);
+}
+
 int main(void) {
     test_contract_compiles();
     test_ist_pro_report_map();
@@ -376,6 +526,9 @@ int main(void) {
     test_requires_x_and_y();
     test_first_pointer_collection_wins();
     test_boot_mouse();
+    test_boot_keyboard();
+    test_keyboard_with_report_id();
+    test_composite_and_discrimination();
 
     if (failures) {
         printf("%d host check(s) failed\n", failures);

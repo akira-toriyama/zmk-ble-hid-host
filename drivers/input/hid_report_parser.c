@@ -54,15 +54,21 @@
 
 /* Usage pages we care about. */
 #define PAGE_GENERIC_DESKTOP 0x01
+#define PAGE_KEYBOARD        0x07
 #define PAGE_BUTTON          0x09
 #define PAGE_CONSUMER        0x0C
 
 /* Generic Desktop usages. */
-#define USAGE_GD_POINTER 0x01
-#define USAGE_GD_MOUSE   0x02
-#define USAGE_GD_X       0x30
-#define USAGE_GD_Y       0x31
-#define USAGE_GD_WHEEL   0x38
+#define USAGE_GD_POINTER  0x01
+#define USAGE_GD_MOUSE    0x02
+#define USAGE_GD_KEYBOARD 0x06
+#define USAGE_GD_X        0x30
+#define USAGE_GD_Y        0x31
+#define USAGE_GD_WHEEL    0x38
+
+/* Keyboard/Keypad page: the eight modifier keys are the contiguous usage run
+ * Left Control (0xE0) .. Right GUI (0xE7). */
+#define USAGE_KBD_MOD_MIN 0xE0
 
 /* Consumer usage. */
 #define USAGE_CONSUMER_AC_PAN 0x0238
@@ -105,8 +111,10 @@ struct parser {
     int depth;             /* current collection nesting depth                 */
     int mouse_level;       /* depth at which the mouse app opened (-1 none,     */
                            /*  -2 == found and now closed: stop assigning)      */
+    int kbd_level;         /* same, for the keyboard application collection     */
 
-    struct zmk_hid_report_layout *out;
+    struct zmk_hid_report_layout *out;       /* pointer layout out (never NULL) */
+    struct zmk_hid_keyboard_layout *out_kbd; /* keyboard layout out (never NULL) */
 };
 
 /* Read `size` raw bytes little-endian into an unsigned value. */
@@ -132,6 +140,22 @@ static int32_t item_s(const uint8_t *d, uint8_t size) {
 
 static bool in_mouse(const struct parser *p) {
     return p->mouse_level >= 0;
+}
+
+static bool in_keyboard(const struct parser *p) {
+    return p->kbd_level >= 0;
+}
+
+/* A Variable, keyboard-page item is the modifier byte when its usages are the
+ * Left Control..Right GUI run (Usage Min 0xE0, or an explicit list led by 0xE0). */
+static bool kbd_usages_are_modifiers(const struct parser *p) {
+    if (p->has_usage_range) {
+        return p->usage_min == USAGE_KBD_MOD_MIN;
+    }
+    if (p->usage_count > 0) {
+        return USAGE_ID(p->usages[0]) == USAGE_KBD_MOD_MIN;
+    }
+    return false;
 }
 
 static void clear_local(struct parser *p) {
@@ -220,6 +244,44 @@ static void assign_input(struct parser *p, uint32_t start_bit) {
     }
 }
 
+/* Record the keyboard fields carried by one non-Constant Input main item while
+ * inside the keyboard application collection. Variable + modifier usages -> the
+ * modifier bitfield; an Array item on the keyboard page -> the keycode array. */
+static void assign_kbd_input(struct parser *p, uint32_t start_bit, uint32_t flags) {
+    struct zmk_hid_keyboard_layout *o = p->out_kbd;
+
+    if (o->report_id == 0 && o->modifiers.bit_size == 0 && o->keys.bit_size == 0) {
+        o->report_id = p->g.report_id; /* lock to the report this keyboard lives in */
+    }
+
+    if (flags & HID_IO_VARIABLE) {
+        /* The modifier bitfield: a Variable run of the 0xE0.. usages. */
+        if (p->g.usage_page == PAGE_KEYBOARD && o->modifiers.bit_size == 0 &&
+            kbd_usages_are_modifiers(p)) {
+            uint8_t per = p->g.report_size ? p->g.report_size : 1;
+            uint32_t bits = (uint32_t)p->g.report_count * per;
+            if (bits > 0 && bits <= 32 && start_bit + bits <= BIT_OFFSET_MAX) {
+                o->modifiers.bit_offset = (uint16_t)start_bit;
+                o->modifiers.bit_size = (uint8_t)bits;
+                o->modifiers.is_signed = false;
+            }
+        }
+    } else {
+        /* The keycode Array (Variable flag clear): each of report_count slots is
+         * one keycode of report_size bits. */
+        if (p->g.usage_page == PAGE_KEYBOARD && o->keys.bit_size == 0) {
+            uint8_t per = p->g.report_size ? p->g.report_size : 8;
+            uint8_t count = p->g.report_count;
+            if (count > 0 && start_bit + (uint32_t)count * per <= BIT_OFFSET_MAX) {
+                o->keys.bit_offset = (uint16_t)start_bit;
+                o->keys.bit_size = per;
+                o->keys.is_signed = false;
+                o->key_count = count;
+            }
+        }
+    }
+}
+
 static void handle_main(struct parser *p, uint8_t tag, const uint8_t *data, uint8_t size) {
     switch (tag) {
     case HID_MAIN_INPUT: {
@@ -228,6 +290,9 @@ static void handle_main(struct parser *p, uint8_t tag, const uint8_t *data, uint
 
         if (in_mouse(p) && !(flags & HID_IO_CONSTANT) && (flags & HID_IO_VARIABLE)) {
             assign_input(p, p->bit_cursor);
+        }
+        if (in_keyboard(p) && !(flags & HID_IO_CONSTANT)) {
+            assign_kbd_input(p, p->bit_cursor, flags);
         }
         /* Constant padding still occupies bits. Saturate rather than wrap so a
          * pathological descriptor can't fold the cursor back over real fields. */
@@ -245,13 +310,18 @@ static void handle_main(struct parser *p, uint8_t tag, const uint8_t *data, uint
     case HID_MAIN_COLLECTION: {
         uint32_t type = item_u(data, size);
         bool is_mouse_usage = false;
+        bool is_kbd_usage = false;
 
         if (p->usage_count > 0) {
             uint32_t u = p->usages[p->usage_count - 1];
             is_mouse_usage = (USAGE_PAGE(u) == PAGE_GENERIC_DESKTOP && USAGE_ID(u) == USAGE_GD_MOUSE);
+            is_kbd_usage = (USAGE_PAGE(u) == PAGE_GENERIC_DESKTOP && USAGE_ID(u) == USAGE_GD_KEYBOARD);
         }
         if (type == HID_COLLECTION_APPLICATION && is_mouse_usage && p->mouse_level == -1) {
             p->mouse_level = p->depth; /* this collection opens the mouse app */
+        }
+        if (type == HID_COLLECTION_APPLICATION && is_kbd_usage && p->kbd_level == -1) {
+            p->kbd_level = p->depth; /* this collection opens the keyboard app */
         }
         p->depth++;
         break;
@@ -262,6 +332,9 @@ static void handle_main(struct parser *p, uint8_t tag, const uint8_t *data, uint
         }
         if (p->mouse_level >= 0 && p->depth <= p->mouse_level) {
             p->mouse_level = -2; /* mouse app closed: lock the layout */
+        }
+        if (p->kbd_level >= 0 && p->depth <= p->kbd_level) {
+            p->kbd_level = -2; /* keyboard app closed: lock the layout */
         }
         break;
     default:
@@ -336,17 +409,13 @@ static void handle_local(struct parser *p, uint8_t tag, const uint8_t *data, uin
     }
 }
 
-int zmk_hid_parse_report_map(const uint8_t *report_map, size_t len,
-                             struct zmk_hid_report_layout *out) {
-    if (!report_map || !out) {
-        return -1;
-    }
-
-    struct parser p;
-    memset(&p, 0, sizeof(p));
-    memset(out, 0, sizeof(*out));
-    p.out = out;
-    p.mouse_level = -1;
+/* Shared item-stream walk. The caller has memset *p and both layout outs and set
+ * p->out / p->out_kbd; this records the pointer AND keyboard fields in one pass
+ * (composite descriptors carry both). Each public entry point decides validity
+ * from the layout it returns. */
+static void run_parser(const uint8_t *report_map, size_t len, struct parser *p) {
+    p->mouse_level = -1;
+    p->kbd_level = -1;
 
     size_t i = 0;
     while (i < len) {
@@ -374,13 +443,13 @@ int zmk_hid_parse_report_map(const uint8_t *report_map, size_t len,
 
         switch (type) {
         case HID_TYPE_MAIN:
-            handle_main(&p, tag, data, data_len);
+            handle_main(p, tag, data, data_len);
             break;
         case HID_TYPE_GLOBAL:
-            handle_global(&p, tag, data, data_len);
+            handle_global(p, tag, data, data_len);
             break;
         case HID_TYPE_LOCAL:
-            handle_local(&p, tag, data, data_len);
+            handle_local(p, tag, data, data_len);
             break;
         default:
             break;
@@ -388,10 +457,49 @@ int zmk_hid_parse_report_map(const uint8_t *report_map, size_t len,
 
         i += (size_t)1 + data_len;
     }
+}
+
+int zmk_hid_parse_report_map(const uint8_t *report_map, size_t len,
+                             struct zmk_hid_report_layout *out) {
+    if (!report_map || !out) {
+        return -1;
+    }
+
+    struct parser p;
+    struct zmk_hid_keyboard_layout kbd; /* unused here; the shared walk fills both
+                                         * layouts in one pass and we keep only out */
+    memset(&p, 0, sizeof(p));
+    memset(out, 0, sizeof(*out));
+    memset(&kbd, 0, sizeof(kbd));
+    p.out = out;
+    p.out_kbd = &kbd;
+
+    run_parser(report_map, len, &p);
 
     /* A usable pointer needs at least relative X and Y, and the descriptor must
      * be well-formed (every Collection closed -- an unbalanced map means we may
      * have mis-tracked where the mouse collection ends). */
     out->valid = (out->x.bit_size != 0 && out->y.bit_size != 0 && p.depth == 0);
+    return out->valid ? 0 : -1;
+}
+
+int zmk_hid_parse_keyboard_report_map(const uint8_t *report_map, size_t len,
+                                      struct zmk_hid_keyboard_layout *out) {
+    if (!report_map || !out) {
+        return -1;
+    }
+
+    struct parser p;
+    struct zmk_hid_report_layout ptr; /* unused here; see zmk_hid_parse_report_map */
+    memset(&p, 0, sizeof(p));
+    memset(&ptr, 0, sizeof(ptr));
+    memset(out, 0, sizeof(*out));
+    p.out = &ptr;
+    p.out_kbd = out;
+
+    run_parser(report_map, len, &p);
+
+    /* A usable keyboard needs a keycode array; the descriptor must be balanced. */
+    out->valid = (out->keys.bit_size != 0 && p.depth == 0);
     return out->valid ? 0 : -1;
 }
