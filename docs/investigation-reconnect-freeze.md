@@ -571,15 +571,19 @@ split-central levers (D: already maxed/equalled for us).
    distance, cut 2.4 GHz interference (USB3 hubs / Wi-Fi), reposition antenna; if
    the board exposes it, TX **+8 dBm**. These raise retransmit-success headroom
    before supervision expiry and cannot destabilize param negotiation.
-3. **FIX-B — central-forced shorter supervision timeout** (`bt_conn_le_param_update`
-   at `subscribe_pending` ~`hog_central.c:448-459`): request e.g.
-   `BT_LE_CONN_PARAM(6,12,44,100)` (timeout 1000 ms; don't go below
-   `(1+latency)×interval×2` ≈ 675 ms or the peer rejects). Converts a long freeze
-   into a shorter, faster-recovering blip — **does NOT remove drops**, and the IST
-   PRO pins timeout 2160 ms and may simply ignore it (it ignored the longer-timeout
-   request too); §14 also showed param-update churn can WORSEN reconnect, so issue
-   it ONCE, well after discovery-done (≈+500 ms), and only if the user still finds
-   the freeze duration unacceptable after #1+#2.
+3. **FIX-B — central-forced shorter supervision timeout.** Full executable plan:
+   **`docs/plan-fix-b-supervision-timeout.md`** (source-verified + adversarially
+   red-teamed). Summary: a delayable work fires ~700 ms after discovery-done and
+   calls `bt_conn_le_param_update(default_conn, …)` to lower only the timeout. As
+   CENTRAL this drives a non-vetoable `HCI LE Connection Update` (≠ the §14 L2CAP
+   path the peer overrode). Validity rule (`hci_core.c:1810`) is
+   `timeout*4 > (1+latency)*interval_max`, so **pin interval_max=6** and start at
+   `BT_LE_CONN_PARAM_INIT(6,6,44,120)` = 7.5 ms / latency 44 / **timeout 1200 ms**
+   (floor = 68 = 680 ms). NOTE: the earlier `(6,12,44,100)` value was INVALID
+   (`400 ≯ 540`). Converts a long freeze into a shorter blip — **does NOT remove
+   drops**; risk it feels worse (more frequent drops / reconnect storm). Issue ONCE,
+   well after discovery-done; optional Phase-2 `le_param_req` clamp if the peer
+   re-requests 2160 ms. Try only if RF (#2) is insufficient.
 4. **C7 / B3 (DEPRIORITIZED):** C7 = `if (disc_state != DISC_IDLE) return
    BT_GATT_ITER_CONTINUE;` early-return in `notify_cb` (~`hog_central.c:178`); B3 =
    cache the parsed `layout` addr-keyed (same-boot only) and skip the report-map
