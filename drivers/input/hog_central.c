@@ -167,7 +167,7 @@ static void report_work_handler(struct k_work *work)
 		}
 
 		if (zmk_hid_decode_report(&layout, evt.data, evt.len, &report) == 0) {
-			LOG_INF("report h=%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%04x",
+			LOG_DBG("report h=%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%04x",
 				evt.value_handle, report.dx, report.dy, report.wheel,
 				report.hwheel, (unsigned)report.buttons);
 			ble_hid_host_publish(host_dev, &report);
@@ -444,8 +444,17 @@ static void subscribe_pending(struct bt_conn *conn)
 	int err;
 
 	if (pending_idx >= pending_count) {
+		struct bt_conn_info info;
 		disc_state = DISC_IDLE;
 		LOG_INF("discovery done: subscribed to %u report(s)", sub_count);
+		/* OBSERVE-only: log the EFFECTIVE link params even if the peer never
+		 * sent a param-update (then le_param_updated never fires). interval unit
+		 * 1.25 ms, timeout unit 10 ms. */
+		if (bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE) {
+			LOG_INF("effective params @disc-done: interval %u.%02u ms, latency %u, timeout %u ms",
+				(info.le.interval * 5U) / 4U, ((info.le.interval * 5U) % 4U) * 25U,
+				info.le.latency, info.le.timeout * 10U);
+		}
 		return;
 	}
 
@@ -637,8 +646,14 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 		return;
 	}
 
-	/* Request 7.5ms (interval 6 x 1.25ms), latency 0, 4s timeout; peer may downgrade. */
-	struct bt_le_conn_param *cp = BT_LE_CONN_PARAM(6, 6, 0, 400);
+	/* Interval 7.5-15ms (6-12 x 1.25ms), latency 0, 5s supervision timeout.
+	 * NOTE (docs §14): the interval-widen EXPERIMENT (requested 15-30ms to give the
+	 * host more wall-clock per event to recycle RX nodes) was VETOED on device --
+	 * the IST PRO renegotiates to its OWN params every connect: interval 7.50 ms,
+	 * latency 44, timeout 2160 ms (logged by le_param_updated). So the create-time
+	 * interval request barely matters; reverted to 6-12 to avoid pointless
+	 * renegotiation churn. The interval throughput lever is dead for this peer. */
+	struct bt_le_conn_param *cp = BT_LE_CONN_PARAM(6, 12, 0, 500);
 
 	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, cp, &default_conn);
 	if (err) {
@@ -740,10 +755,35 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	start_scan(); /* auto-reconnect: re-scan, match the bonded peer, re-discover */
 }
 
+/* OBSERVE-only: log the FINAL negotiated link params (no behavior change). The
+ * mouse (peripheral) may send an L2CAP conn-param-update-request after connect;
+ * with no le_param_req registered Zephyr auto-accepts it, so the real
+ * supervision timeout is otherwise invisible. Fires once per (re)negotiation --
+ * NOT per-PDU. interval unit = 1.25 ms, timeout unit = 10 ms. */
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+			     uint16_t latency, uint16_t timeout)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("conn params updated: interval %u.%02u ms, latency %u, timeout %u ms",
+		(interval * 5U) / 4U, ((interval * 5U) % 4U) * 25U, latency, timeout * 10U);
+}
+
+/* OBSERVE-only: log the negotiated PHY to PROVE the link runs at LE 2M (expected,
+ * auto-requested by CONFIG_BT_AUTO_PHY_UPDATE) vs being pinned to 1M by the peer.
+ * Requires CONFIG_BT_USER_PHY_UPDATE=y -- without it the host neither records the
+ * PHY nor calls this back. 1 = LE 1M, 2 = LE 2M, 4 = LE Coded. */
+static void le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("PHY updated: tx %u, rx %u (1=1M 2=2M 4=coded)", param->tx_phy, param->rx_phy);
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
 	.security_changed = security_changed,
+	.le_param_updated = le_param_updated,
+	.le_phy_updated = le_phy_updated,
 };
 
 /* ─────────────── pairing callbacks (NoInputNoOutput -> Just Works) ───────── */
