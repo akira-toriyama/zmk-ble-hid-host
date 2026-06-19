@@ -5,9 +5,50 @@
 > This doc is only about the **residual** freeze that remains.
 
 **Status:** OPEN. Partially mitigated (no longer a permanent wedge), not eliminated.
-**Branch:** `fix/reconnect-rx-buffer-wedge` (commit `ef1e623` + an uncommitted
-`LOG_INF`→`LOG_DBG` hygiene change in `hog_central.c`). Not yet merged.
-**Date:** 2026-06-18.
+**Branch:** `fix/reconnect-rx-buffer-wedge` (rebased onto `main` 6964292 which now
+has the M4 8-button/wheel features). Not yet merged; rebase rewrote history so a
+push will need `--force-with-lease`.
+**Date:** first 2026-06-18; latest 2026-06-19.
+
+---
+
+> ## ⏭️ NEXT SESSION — START HERE
+>
+> **The move-freeze is a steady-state RX-node recycle-throughput ceiling** (single-
+> threaded host recycle, no HCI flow control — §13). Eliminating it cleanly is most
+> likely NOT possible in stock firmware. What is RULED OUT (don't retry): RX buffer
+> depth (§9), 2M PHY + DLE (§13), FORCE_MD (§13, inert on an RX-only host), and the
+> **connection-interval lever (§14 — VETOED on device: the IST PRO pins interval
+> 7.5 ms / latency 44 / timeout 2160 ms every connect; widening it made the freeze
+> occur MORE easily, so it was reverted).**
+>
+> **The ONE untested lever left: subscription pruning** — subscribe only to the
+> motion report id=2 and see if it cuts the inbound notification rate (peer-
+> independent). First confirm the other 4 reports (ids 1/4/6/9) actually notify
+> during the flood (DBG "ignoring report" at hog_central.c:164); if they're idle,
+> pruning won't help and the move-freeze is a hardware ceiling → switch to
+> MITIGATION only (shorter supervision timeout via a central-forced
+> `bt_conn_le_param_update`, + antenna placement / TX +8 dBm). Details: §14.
+>
+> **SEPARATE open bug:** "idle ~1 h → dead, only a dongle re-plug revives" — see §12
+> (not yet investigated; owner asked to do it after the move-freeze).
+>
+> **Working tree (uncommitted) carries diagnostic-only changes** in
+> `hog_central.c` (le_param_updated + le_phy_updated + effective-params loggers) and
+> the shield `.conf` (`CONFIG_ZMK_LOGGING_MINIMAL=y`, `CONFIG_BT_USER_PHY_UPDATE=y`)
+> — keep for the next experiment; strip before any production merge.
+>
+> **Device build recipe** (A/B/C/D + RX fix + clean logging): build in
+> `/Volumes/workspace/.zmk-blehh-build` via Docker `zmkfirmware/zmk-build-arm:stable`
+> with `-DZMK_CONFIG=<zmk-mouse>/config -DZMK_EXTRA_MODULES=<zmk-ble-hid-host>
+> -DSHIELD=ble_hid_host_receiver -DCONFIG_ZMK_USB_LOGGING=y` (combines zmk-mouse's
+> A/B/C/D keymap+conf with this module). Flash = double-tap reset → cp uf2 to
+> `/Volumes/XIAO-SENSE/CURRENT.UF2` (TOP-LEVEL Bash cmd + `dangerouslyDisableSandbox`,
+> retry on "Permission denied"). Rollback `.uf2`s in `.zmk-blehh-build/rollback/`.
+> Logging gotcha (§ here): ZMK defaults `ZMK_LOG_LEVEL=4` (DBG) under USB logging and
+> its per-motion DBG flood DROPS the sparse `ble_hid_host` INF lines from the USB
+> log — `CONFIG_ZMK_LOGGING_MINIMAL=y` silences that so connect/disconnect/param
+> lines survive.
 
 ---
 
@@ -401,3 +442,52 @@ time-to-freeze jumps ⇒ fixed/strongly mitigated; interval vetoed + pruning mar
 ⇒ architectural ceiling ⇒ mitigation-only (shorter timeout + antenna placement).
 
 Full output: run `wf_16dcf436-7b0` → `/private/tmp/.../tasks/wl6bscbo0.output`.
+
+## 14. Interval experiment RESULT — VETOED by the peer; mouse params revealed (2026-06-19)
+
+On-device test of §13's first experiment (interval widened to 15-30 ms + a PHY
+logger + `CONFIG_BT_USER_PHY_UPDATE=y`), built combined with the zmk-mouse config
+so A/B/C/D stayed live. Result is decisive:
+
+- **The IST PRO renegotiates its OWN conn params on every connect; our interval
+  request is REJECTED.** `le_param_updated` logged, every cycle:
+  `interval 7.50 ms, latency 44, timeout 2160 ms`.
+  - **Interval pinned at 7.5 ms** (our 15-30 ms vetoed) ⇒ the interval throughput
+    lever is DEAD for this peer.
+  - **Peripheral latency = 44** (NEW finding): the mouse may skip up to 44 events
+    when idle (~337 ms effective idle wake) ⇒ power saving; irrelevant during the
+    motion flood (it sends every 7.5 ms event while moving).
+  - **Supervision timeout = 2160 ms** — matches the earlier ~2.5-3 s freeze→0x08
+    gap measured in §9.
+- Freeze got WORSE, not just persisted: the bug occurred MORE EASILY (user: "動き
+  悪くなった" = it freezes more readily, NOT a laggy feel) — 6× reason 0x08 in ~45 s.
+  The interval request is renegotiated by the peer on EVERY connect, and that
+  per-connect renegotiation churn destabilizes the fragile reconnect window, so the
+  experiment was net-NEGATIVE. ⇒ reverting the interval was the correct action,
+  and the interval lever is not merely dead but harmful for this peer.
+- PHY: `le_phy_updated` produced no line this capture (rapid reconnect churn
+  likely truncated it before flush). 2M stays ruled-out-by-mechanism (§13).
+- Action taken: reverted the create-time interval to `(6,12,0,500)` — the request
+  was pointless against this peer.
+
+**Decision-rule outcome (per §13): interval VETOED → architectural ceiling.** What
+remains:
+- **NEXT EXPERIMENT (untested, the last peer-independent lever): subscription
+  pruning — subscribe ONLY to the motion report (id=2).** Efficacy is gated on
+  whether the other 4 reports (ids 1/4/6/9) actually notify during the flood
+  (temporarily set `ble_hid_host` to DBG and look for the "ignoring report" line at
+  hog_central.c:164 during motion; if absent, those reports are idle and pruning
+  won't help). SAFETY is fine — motion + buttons (BTN_5/6=A/B) + tilt (C/D) are all
+  on id=2.
+- **MITIGATION (independent of any cure): shorter supervision timeout for faster
+  auto-recovery.** The mouse pins timeout=2160 ms, so the CENTRAL must force a
+  shorter one via `bt_conn_le_param_update()` (the §11 "FIX-B" hook at discovery-
+  done) AND the peer may re-veto — uncertain. Complement with antenna placement +
+  optional TX +8 dBm.
+- **HONEST END STATE:** if subscription pruning gives little, the move-freeze under
+  hard aggressive motion is a hardware/architectural ceiling NOT fixable in stock
+  firmware (single-threaded RX recycle, no HCI flow control — §13). The realistic
+  deliverable is then "a shorter, faster-recovering blip," not "no drops."
+
+Capture: `/tmp/exp1.log` (143 lines: the `conn params updated` / `effective params`
+lines show 7.50 ms / lat 44 / 2160 ms; 6× reason 0x08).
