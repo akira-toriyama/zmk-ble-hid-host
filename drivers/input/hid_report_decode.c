@@ -112,3 +112,58 @@ int zmk_hid_decode_report(const struct zmk_hid_report_layout *layout,
 
     return 0;
 }
+
+/* Highest bit index the keyboard layout touches == minimum payload size. */
+static size_t kbd_payload_bits(const struct zmk_hid_keyboard_layout *l) {
+    size_t bits = 0;
+    if (l->modifiers.bit_size) {
+        size_t end = (size_t)l->modifiers.bit_offset + l->modifiers.bit_size;
+        if (end > bits) {
+            bits = end;
+        }
+    }
+    if (l->key_count && l->keys.bit_size) {
+        size_t end = (size_t)l->keys.bit_offset + (size_t)l->key_count * l->keys.bit_size;
+        if (end > bits) {
+            bits = end;
+        }
+    }
+    return bits;
+}
+
+int zmk_hid_decode_keyboard_report(const struct zmk_hid_keyboard_layout *layout,
+                                   const uint8_t *report, size_t len,
+                                   struct zmk_hid_keyboard_report *out) {
+    if (!layout || !report || !out || !layout->valid) {
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    size_t need = (kbd_payload_bits(layout) + 7) / 8;
+    if (len < need) {
+        return -1; /* payload too short for this layout */
+    }
+
+    if (layout->modifiers.bit_size) {
+        out->modifiers = (uint8_t)extract(report, len, &layout->modifiers);
+    }
+
+    /* Keycode array: read key_count entries, keep the non-zero ones. 0x00 means
+     * "no key" and 0x01 is ErrorRollOver -- both are dropped. */
+    for (uint8_t i = 0; i < layout->key_count && out->key_count < ZMK_HID_MAX_KEYS; i++) {
+        uint16_t off =
+            (uint16_t)((uint32_t)layout->keys.bit_offset + (uint32_t)i * layout->keys.bit_size);
+        struct zmk_hid_field entry = {
+            .bit_offset = off,
+            .bit_size = layout->keys.bit_size,
+            .is_signed = false,
+        };
+        uint32_t code = (uint32_t)extract(report, len, &entry);
+        if (code != 0 && code != 0x01) {
+            out->keys[out->key_count++] = (uint8_t)code;
+        }
+    }
+
+    return 0;
+}
