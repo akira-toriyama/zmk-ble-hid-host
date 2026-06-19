@@ -4,10 +4,14 @@
 > ORIGINAL reported bug (re-pairing on every reconnect) is **fixed and merged**.
 > This doc is only about the **residual** freeze that remains.
 
-**Status:** OPEN. Partially mitigated (no longer a permanent wedge), not eliminated.
-**Branch:** `fix/reconnect-rx-buffer-wedge` (rebased onto `main` 6964292 which now
-has the M4 8-button/wheel features). Not yet merged; rebase rewrote history so a
-push will need `--force-with-lease`.
+**Status:** CLOSED as a hardware ceiling (no firmware cure). Every firmware lever
+incl. the last-resort mitigations was tried ON-DEVICE and exhausted (FIX-B §16,
+max-RX §17). Mitigation = behavioral + RF only. The mouse is fully usable for
+normal use; only the immediate-aggressive-move stress case still hiccups.
+**Branch:** `fix/reconnect-rx-buffer-wedge` (rebased onto `main` 6964292 with the
+M4 features). Not yet merged; rebase rewrote history so a push needs
+`--force-with-lease`. FIX-B code lives on `experiment/fix-b-supervision-timeout`
+(not merged).
 **Date:** first 2026-06-18; latest 2026-06-19.
 
 ---
@@ -27,21 +31,24 @@ push will need `--force-with-lease`.
 > the only true fixes need a Nordic-LLL fork (forbidden) or peer cooperation
 > (impossible for a 3rd-party mouse).
 >
-> **What remains is MITIGATION ONLY (none eliminate the steady-state drop):** ship
-> the proven-but-UNMERGED RX 12/10 improvement on this branch; free RF/antenna/
-> distance + TX +8 dBm first; then optionally FIX-B (central-forced shorter
-> supervision timeout = shorter blip, may be peer-rejected). Marginal firmware
-> levers C7 (drop notify during discovery) / B3 (skip report-map read on reconnect)
-> target the reconnect window, which the forensics say is NOT where this repro
-> fails — deprioritized. Full analysis + ranked proposal: **§15**.
+> **ON-DEVICE follow-through is now DONE (2026-06-19) — all mitigations exhausted:**
+> FIX-B (central-forced shorter supervision timeout, both phases) was implemented +
+> flashed + tested → **DEAD END** (peer fights it relentlessly, drops got more
+> frequent — §16); and maxing the RX pool to 18/20 was flashed + tested → **NO
+> benefit** (§17). The freeze is a confirmed hardware ceiling. **Shipped firmware =
+> RX 18/20** (per user choice; behaves identically to 12/10 for the freeze, just max
+> burst headroom). **Only mitigations are non-firmware:** behavioral (wait ~2-3 s
+> after power-on before flailing; keep the link up) + RF (user confirmed already
+> optimal). Full analysis: **§15** (no-cure verdict), **§16** (FIX-B), **§17** (RX-18).
 >
-> **SEPARATE open bug:** "idle ~1 h → dead, only a dongle re-plug revives" — see §12
-> (not yet investigated; owner asked to do it after the move-freeze).
+> **NEXT (if anything): the SEPARATE open bug** — "idle ~1 h → dead, only a dongle
+> re-plug revives" — see §12 (not yet investigated; owner asked to do it after the
+> move-freeze, which is now closed).
 >
-> **Working tree (uncommitted) carries diagnostic-only changes** in
-> `hog_central.c` (le_param_updated + le_phy_updated + effective-params loggers) and
-> the shield `.conf` (`CONFIG_ZMK_LOGGING_MINIMAL=y`, `CONFIG_BT_USER_PHY_UPDATE=y`)
-> — keep for the next experiment; strip before any production merge.
+> **Working tree is CLEAN.** The OBSERVE diagnostic loggers (le_param_updated +
+> le_phy_updated + effective-params) and `CONFIG_ZMK_LOGGING_MINIMAL`/
+> `CONFIG_BT_USER_PHY_UPDATE` are committed on `fix/reconnect-rx-buffer-wedge` (handy
+> for the §12 idle bug); strip them before any production/no-logging merge.
 >
 > **Device build recipe** (A/B/C/D + RX fix + clean logging): build in
 > `/Volumes/workspace/.zmk-blehh-build` via Docker `zmkfirmware/zmk-build-arm:stable`
@@ -448,75 +455,6 @@ time-to-freeze jumps ⇒ fixed/strongly mitigated; interval vetoed + pruning mar
 
 Full output: run `wf_16dcf436-7b0` → `/private/tmp/.../tasks/wl6bscbo0.output`.
 
-## 16. FIX-B tried ON-DEVICE — DEAD END (2026-06-19)
-
-The §15d / plan-doc mitigation (`docs/plan-fix-b-supervision-timeout.md`) was
-implemented and flashed to the device in two phases. Result: **conn-param
-mitigation does not deliver a usable improvement on the IST PRO — confirmed on
-hardware.** Code preserved on branch `experiment/fix-b-supervision-timeout` (NOT
-merged).
-
-**Phase 1 — central-forced `bt_conn_le_param_update(1200 ms)` at discovery-done +700 ms:**
-- The central update is **non-vetoable and APPLIES** (proof: `conn params updated:
-  ... timeout 1200 ms` logged) — refutes the earlier "peer may reject it" worry.
-- BUT the IST PRO **re-requests its 2160 ms ~400 ms later**, which Zephyr (no
-  `le_param_req`) auto-accepts → reverts. Net: timeout is 2160 ms almost always →
-  no improvement. (Capture: `/tmp/fixb.log` — per cycle: 2160 → 1200 → 2160.)
-
-**Phase 2 — add `le_param_req` that clamps the peer's timeout down to 1200 ms:**
-- The clamp **holds** the applied timeout at 1200 ms (never reverts to 2160 ms).
-- BUT the peer re-requests 2160 ms **relentlessly, every ~400 ms** → the clamp fired
-  **435 times in one capture** = constant LLCP connection-update churn (~11 % of
-  airtime at 7.5 ms interval).
-- 0x08 drops became **MORE frequent (~5-8 s apart)** than the RX-12/10 baseline
-  (~6-13 s) — exactly the §11 prediction "shorter timeout ⇒ shorter but MORE
-  FREQUENT drops." Each recovery is shorter (~1.9 s incl. reconnect) but they happen
-  more often, plus the churn. **Net user experience: not fixed, arguably worse.**
-  (Capture: `/tmp/fixb2.log`.)
-
-**VERDICT (now confirmed on hardware, not just by analysis): every firmware lever —
-including the last-resort conn-param mitigation — is exhausted. The move-freeze
-under hard aggressive motion is a hard architectural ceiling (single-threaded RX
-recycle gated by `ull_pdu_rx_alloc_peek(3)`, no HCI flow control; the IST PRO
-aggressively maintains its own 2160 ms and fights any change). The only remaining
-lever is non-firmware: RF link quality (dongle↔mouse distance, USB3 / 2.4 GHz
-interference, antenna placement, TX +8 dBm).** Firmware best-known state =
-RX 12/10 (idle rock-solid, permanent wedge gone); ship that, accept the residual.
-
-Rollback firmware (restore the clean pre-FIX-B device):
-`/Volumes/workspace/.zmk-blehh-build/rollback/abcd_rx12_reverted_logging.uf2`
-(RX 12/10 + §14 interval revert + logging, no FIX-B). FIX-B builds kept as
-`fixb_1200ms_logging.uf2` / `fixb_phase2_clamp_logging.uf2` (do NOT use for daily).
-
-## 17. RX buffers MAXED to 18 — tried on-device, NO benefit (2026-06-19)
-
-With RF/distance confirmed already optimal by the user and FIX-B failed (§16), the
-last free firmware lever was tested: **max the RX pool** —
-`CONFIG_BT_CTLR_RX_BUFFERS` 12→**18** (the max; controller PDU_RX = 3+18 = 21) and
-`CONFIG_BT_BUF_ACL_RX_COUNT_EXTRA` 10→**20** (host ACL = 1+20 = 21, matched so the
-host never bottlenecks the controller recycle). Built, **`.config` verified 18/20**,
-flashed (logging combo), and run against the immediate-aggressive-move repro.
-
-**Result — no meaningful change from the RX 12/10 baseline:**
-- 5× `reason 0x08` in ~27 s; survival between drops 4.1 / 6.5 / 4.1 / 9.6 s;
-  intervals ~5-10 s — statistically the same as RX 12/10's ~6-13 s (§9). The peer's
-  timeout stayed its own 2160 ms (no FIX-B; `FIX-B`/`clamping` lines = 0, confirming
-  a clean RX-only build).
-
-**Confirms §9/§13 exactly:** deeper pools raise BURST absorption only marginally and
-do **not** move the freeze; the steady-state RX-node recycle ceiling dominates even
-the immediate-burst case. **Reverted `.conf` to RX 12/10** (the committed baseline;
-RX-18 had no benefit to justify deviating). RX-18 build kept as
-`rollback/rx18_logging.uf2` (do NOT use).
-
-**FINAL on-device tally — every firmware lever is now exhausted on hardware:** RX
-depth (incl. max 18), thread-starvation (refuted), 2M/DLE/FORCE_MD, conn-interval
-(peer-vetoed), subscription pruning (flood is 100% id=2), FIX-B conn-param timeout
-(peer fights, §16). **The move-freeze under hard aggressive motion is a hardware
-ceiling — not fixable in stock firmware, period.** Only mitigations: behavioral
-(wait ~2-3 s after power-on before flailing; keep the link up — don't power-cycle the
-mouse often) + RF (already optimal here). Recommended firmware = RX 12/10 baseline.
-
 ## 14. Interval experiment RESULT — VETOED by the peer; mouse params revealed (2026-06-19)
 
 On-device test of §13's first experiment (interval widened to 15-30 ms + a PHY
@@ -672,3 +610,72 @@ Full hunt output: `wf_645d2eb1-4f8` →
 verdicts). Key file:lines: root cause `lll_conn.c:1148`; recycle chain
 `hci_driver.c:458/459/535`; FIX-B hook `hog_central.c:448-459`; param-veto context
 `hog_central.c:649-656`; forensic timeline `verify.log:3368` vs `:3369/:4368`.
+## 16. FIX-B tried ON-DEVICE — DEAD END (2026-06-19)
+
+The §15d / plan-doc mitigation (`docs/plan-fix-b-supervision-timeout.md`) was
+implemented and flashed to the device in two phases. Result: **conn-param
+mitigation does not deliver a usable improvement on the IST PRO — confirmed on
+hardware.** Code preserved on branch `experiment/fix-b-supervision-timeout` (NOT
+merged).
+
+**Phase 1 — central-forced `bt_conn_le_param_update(1200 ms)` at discovery-done +700 ms:**
+- The central update is **non-vetoable and APPLIES** (proof: `conn params updated:
+  ... timeout 1200 ms` logged) — refutes the earlier "peer may reject it" worry.
+- BUT the IST PRO **re-requests its 2160 ms ~400 ms later**, which Zephyr (no
+  `le_param_req`) auto-accepts → reverts. Net: timeout is 2160 ms almost always →
+  no improvement. (Capture: `/tmp/fixb.log` — per cycle: 2160 → 1200 → 2160.)
+
+**Phase 2 — add `le_param_req` that clamps the peer's timeout down to 1200 ms:**
+- The clamp **holds** the applied timeout at 1200 ms (never reverts to 2160 ms).
+- BUT the peer re-requests 2160 ms **relentlessly, every ~400 ms** → the clamp fired
+  **435 times in one capture** = constant LLCP connection-update churn (~11 % of
+  airtime at 7.5 ms interval).
+- 0x08 drops became **MORE frequent (~5-8 s apart)** than the RX-12/10 baseline
+  (~6-13 s) — exactly the §11 prediction "shorter timeout ⇒ shorter but MORE
+  FREQUENT drops." Each recovery is shorter (~1.9 s incl. reconnect) but they happen
+  more often, plus the churn. **Net user experience: not fixed, arguably worse.**
+  (Capture: `/tmp/fixb2.log`.)
+
+**VERDICT (now confirmed on hardware, not just by analysis): every firmware lever —
+including the last-resort conn-param mitigation — is exhausted. The move-freeze
+under hard aggressive motion is a hard architectural ceiling (single-threaded RX
+recycle gated by `ull_pdu_rx_alloc_peek(3)`, no HCI flow control; the IST PRO
+aggressively maintains its own 2160 ms and fights any change). The only remaining
+lever is non-firmware: RF link quality (dongle↔mouse distance, USB3 / 2.4 GHz
+interference, antenna placement, TX +8 dBm).** Firmware best-known state =
+RX 12/10 (idle rock-solid, permanent wedge gone); ship that, accept the residual.
+
+Rollback firmware (restore the clean pre-FIX-B device):
+`/Volumes/workspace/.zmk-blehh-build/rollback/abcd_rx12_reverted_logging.uf2`
+(RX 12/10 + §14 interval revert + logging, no FIX-B). FIX-B builds kept as
+`fixb_1200ms_logging.uf2` / `fixb_phase2_clamp_logging.uf2` (do NOT use for daily).
+
+## 17. RX buffers MAXED to 18 — tried on-device, NO benefit (2026-06-19)
+
+With RF/distance confirmed already optimal by the user and FIX-B failed (§16), the
+last free firmware lever was tested: **max the RX pool** —
+`CONFIG_BT_CTLR_RX_BUFFERS` 12→**18** (the max; controller PDU_RX = 3+18 = 21) and
+`CONFIG_BT_BUF_ACL_RX_COUNT_EXTRA` 10→**20** (host ACL = 1+20 = 21, matched so the
+host never bottlenecks the controller recycle). Built, **`.config` verified 18/20**,
+flashed (logging combo), and run against the immediate-aggressive-move repro.
+
+**Result — no meaningful change from the RX 12/10 baseline:**
+- 5× `reason 0x08` in ~27 s; survival between drops 4.1 / 6.5 / 4.1 / 9.6 s;
+  intervals ~5-10 s — statistically the same as RX 12/10's ~6-13 s (§9). The peer's
+  timeout stayed its own 2160 ms (no FIX-B; `FIX-B`/`clamping` lines = 0, confirming
+  a clean RX-only build).
+
+**Confirms §9/§13 exactly:** deeper pools raise BURST absorption only marginally and
+do **not** move the freeze; the steady-state RX-node recycle ceiling dominates even
+the immediate-burst case. **DECISION (user preference): KEEP RX 18/20.** It has no
+measured benefit over 12/10 for the freeze, but no downside either (~3 KB more RAM,
+max burst headroom), so the `.conf` is set to 18/20 to match the flashed device
+(`rollback/rx18_logging.uf2`). 12/10 and 18/20 are interchangeable for this freeze.
+
+**FINAL on-device tally — every firmware lever is now exhausted on hardware:** RX
+depth (incl. max 18), thread-starvation (refuted), 2M/DLE/FORCE_MD, conn-interval
+(peer-vetoed), subscription pruning (flood is 100% id=2), FIX-B conn-param timeout
+(peer fights, §16). **The move-freeze under hard aggressive motion is a hardware
+ceiling — not fixable in stock firmware, period.** Only mitigations: behavioral
+(wait ~2-3 s after power-on before flailing; keep the link up — don't power-cycle the
+mouse often) + RF (already optimal here). Shipped firmware = RX 18/20 (per user choice; identical freeze behavior to 12/10).
