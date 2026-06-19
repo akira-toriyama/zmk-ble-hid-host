@@ -255,12 +255,17 @@ static void assign_kbd_input(struct parser *p, uint32_t start_bit, uint32_t flag
     }
 
     if (flags & HID_IO_VARIABLE) {
-        /* The modifier bitfield: a Variable run of the 0xE0.. usages. */
+        /* The modifier bitfield: a Variable run of the 0xE0.. usages. Only the
+         * standard 1-bit-per-key packed form is recorded -- the decoder reports
+         * modifiers as a uint8_t bitmask "bit i == usage 0xE0+i", so a wider
+         * (report_size > 1) field can't be represented and is left absent rather
+         * than mis-decoded. Such descriptors are spec-legal but not seen in real
+         * keyboards. */
         if (p->g.usage_page == PAGE_KEYBOARD && o->modifiers.bit_size == 0 &&
             kbd_usages_are_modifiers(p)) {
             uint8_t per = p->g.report_size ? p->g.report_size : 1;
             uint32_t bits = (uint32_t)p->g.report_count * per;
-            if (bits > 0 && bits <= 32 && start_bit + bits <= BIT_OFFSET_MAX) {
+            if (per == 1 && bits > 0 && bits <= 8 && start_bit + bits <= BIT_OFFSET_MAX) {
                 o->modifiers.bit_offset = (uint16_t)start_bit;
                 o->modifiers.bit_size = (uint8_t)bits;
                 o->modifiers.is_signed = false;

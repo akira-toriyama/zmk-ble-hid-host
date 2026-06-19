@@ -480,6 +480,39 @@ static void test_keyboard_with_report_id(void) {
     check_kbd_decode(310, &r, &want);
 }
 
+/* ── M2+: a non-standard (report_size != 1) modifier field is NOT recorded ── */
+static void test_keyboard_nonstandard_modifier_ignored(void) {
+    /* Modifier item declared as 8 x 2-bit (spec-legal, never seen in real
+     * keyboards). The decoder reports modifiers as a 1-bit-per-key uint8_t mask,
+     * so the parser must leave modifiers absent rather than record a 16-bit field
+     * that would truncate/mis-map on decode. The keycode array is unaffected. */
+    static const uint8_t map[] = {
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01,             /* GD/Keyboard, Collection(App)        */
+        0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,             /*   Keyboard page, Usage 0xE0..0xE7   */
+        0x15, 0x00, 0x25, 0x03, 0x75, 0x02, 0x95, 0x08, /*   logical 0..3, SIZE 2, count 8     */
+        0x81, 0x02,                                     /*   Input (Var) 16-bit modifier field */
+        0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, /*   count 6, size 8, logical 0..101   */
+        0x05, 0x07, 0x19, 0x00, 0x29, 0x65,             /*   Keyboard page, Usage 0x00..0x65   */
+        0x81, 0x00,                                     /*   Input (Array) keycodes            */
+        0xc0,                                           /* End Collection                      */
+    };
+
+    struct zmk_hid_keyboard_layout l;
+    CHECK(zmk_hid_parse_keyboard_report_map(map, sizeof(map), &l) == 0);
+    CHECK(l.valid);                  /* still usable via the keycode array */
+    CHECK(l.modifiers.bit_size == 0); /* the 2-bit-wide modifier field is dropped */
+    check_field("nonstd keys", &l.keys, 16, 8, false); /* array starts after the 16 modifier bits */
+    CHECK(l.key_count == 6);
+
+    /* Even with every modifier bit set, decode reports modifiers == 0 (absent),
+     * and the keycode array still decodes correctly. */
+    uint8_t payload[] = {0xff, 0xff, 0x04, 0, 0, 0, 0, 0};
+    struct zmk_hid_keyboard_report r;
+    CHECK(zmk_hid_decode_keyboard_report(&l, payload, sizeof(payload), &r) == 0);
+    struct kexpect want = {.modifiers = 0, .keys = {0x04}, .key_count = 1};
+    check_kbd_decode(320, &r, &want);
+}
+
 /* ─── M2+: composite-device parsing + class discrimination (real hardware) ─ */
 static void test_composite_and_discrimination(void) {
     /* The IST PRO is a COMPOSITE device: its Report Map carries a Mouse
@@ -528,6 +561,7 @@ int main(void) {
     test_boot_mouse();
     test_boot_keyboard();
     test_keyboard_with_report_id();
+    test_keyboard_nonstandard_modifier_ignored();
     test_composite_and_discrimination();
 
     if (failures) {
