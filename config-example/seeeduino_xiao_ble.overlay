@@ -7,7 +7,7 @@
  *   - the input device is a plain root node with compatible "zmk,ble-hid-host"
  *   - a zmk,input-listener node (with a label) subscribes to it
  *   - input-processors are attached in the *keymap* via the listener's label
- *     (see ist_pro.keymap.snippet)
+ *     (see pointer.keymap.snippet)
  */
 
 / {
@@ -18,7 +18,7 @@
         /* Optional: only connect to a peer advertising this EXACT name.
          * Capture the real advertised name with nRF Connect (README section 8).
          * Leave commented to connect to the first discovered HOGP pointer. */
-        // device-name = "ELECOM TrackBall";
+        // device-name = "My BLE Device";
     };
 
     /* Feed the device's input into ZMK. Processors are attached in the keymap

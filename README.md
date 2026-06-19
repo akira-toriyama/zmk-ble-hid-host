@@ -1,25 +1,29 @@
 # zmk-ble-hid-host
 
 A [ZMK](https://zmk.dev) module that turns an nRF52840 into a **BLE HID host**:
-it connects to a Bluetooth pointing device (HOGP / HID-over-GATT) as a BLE
-**central**, decodes its HID reports, and republishes them into ZMK's input
-subsystem — so the movement/buttons can be remapped by ZMK's standard
-`input-processors` and sent to the PC over USB.
+it connects to a Bluetooth HID device — a keyboard or a pointing device
+(HOGP / HID-over-GATT) — as a BLE **central**, decodes its HID reports, and
+republishes them into ZMK's input subsystem — so the keys/movement/buttons can
+be remapped by ZMK's standard `input-processors` and sent to the PC over USB.
 
 In one line: **the receive half of an HID-Remapper, built as a ZMK module —
-remapping and output are left entirely to ZMK core.**
+remapping and output are left entirely to ZMK core.** The aim is a general
+bridge for Bluetooth keyboards and pointing devices: pointer support is proven
+on hardware today, keyboard support is in progress
+([#7](https://github.com/akira-toriyama/zmk-ble-hid-host/issues/7)).
 
-> **Status: work in progress.** BLE HOGP receive is **proven on real hardware**
-> (a diagnostic probe bonds to the IST PRO and streams its reports — see
-> `HANDOFF.md` §M1), and the **report-map parser + decoder are implemented and
-> host-tested** against the real captured Report Map and reports. Still to do:
-> port the HOGP central into the module, a module firmware-build CI, and
-> publishing decoded events into ZMK (so the cursor actually moves). See
+> **Status: working on real hardware for pointers.** End-to-end is proven: a
+> XIAO nRF52840 dongle bonds to a Bluetooth trackball, decodes its reports, and
+> **the cursor moves on the PC** — with reconnect across power-cycles and
+> button/wheel → key remapping. **Keyboard support** (making it a universal
+> BLE-HID bridge) is the active next step
+> ([#7](https://github.com/akira-toriyama/zmk-ble-hid-host/issues/7)). See
 > **[Project status](#project-status)** and [`HANDOFF.md`](./HANDOFF.md) for
 > exactly what is and isn't done.
 
-Primary use case: a Seeed XIAO nRF52840 dongle bridging an **Elecom IST PRO**
-trackball (BLE) to a PC over USB.
+Primary use case: a Seeed XIAO nRF52840 dongle bridging Bluetooth keyboards and
+pointing devices to a PC over USB. Validated so far on a real Bluetooth
+trackball (the device used to bring up and test the receive path).
 
 ## Architecture
 
@@ -53,9 +57,10 @@ maintainer recommends in [issue #2395](https://github.com/zmkfirmware/zmk/issues
 
 - **MCU:** Seeed XIAO nRF52840 — ZMK board target `seeeduino_xiao_ble`
   (UF2 bootloader: double-reset to mount the drive, drag-drop the `.uf2`).
-- **Input:** Elecom IST PRO, connected over **BLE** (HOGP). 2.4 GHz is not an
-  option — the nRF52840 USB is device-only (no USB host) and its proprietary
-  2.4 GHz protocol can't be received.
+- **Input:** any BLE HID device — keyboard, mouse, or trackball — connected over
+  **BLE** (HOGP). (Validated so far on a real Bluetooth trackball.) 2.4 GHz is
+  not an option — the nRF52840 USB is device-only (no USB host) and proprietary
+  2.4 GHz dongle protocols can't be received.
 - **Output:** USB (the XIAO stays plugged into the PC as a dongle). Output is
   USB, not BLE, to minimise latency.
 
@@ -97,8 +102,9 @@ continuation guide — build/flash from any PC, plus the M4 and M6 plans — is 
 - [x] **Reconnect.** ✅ Bonds persist across reboot and the dongle auto-reconnects
   after a mouse power-cycle / USB replug with **no re-pairing**
   (branch `fix/reconnect-directed-adv`).
-- [ ] **M4 — customization.** Axis/scroll `input-processors` + **mouse-button → key**
-  remap — **config-only**, done in a separate `zmk-config` repo. See the roadmap.
+- [x] **M4 — customization.** ✅ Axis/scroll `input-processors` + **mouse-button → key**
+  remap — config-only, in the [`zmk-mouse`](https://github.com/akira-toriyama/zmk-mouse)
+  config repo; buttons + wheel-tilt → keys verified on hardware.
 - [ ] **M6 — universal BLE-HID bridge.** BT keyboard support (the central is already
   HID-generic; remaining work is keyboard interpret + output). See the roadmap.
 - [ ] **M5 — dongle.** Case, daily use.
@@ -115,14 +121,14 @@ ZMK core is **not** forked — you consume this as a module from your own
 2. **board/shield overlay** — add the `zmk,ble-hid-host` node + an
    `input-listener` (`config-example/seeeduino_xiao_ble.overlay`).
 3. **keymap** — attach `input-processors` to the listener
-   (`config-example/ist_pro.keymap.snippet`).
+   (`config-example/pointer.keymap.snippet`).
 4. **`.conf`** — enable the required Kconfig
    (`config-example/zmk-config.conf.snippet`).
 
 <details>
-<summary><b>Section 8: Capturing the IST PRO HID reports (do this before M2 tuning)</b></summary>
+<summary><b>Section 8: Capturing a device's HID reports (useful when bringing up a new device)</b></summary>
 
-The IST PRO's HID report byte layout is **not publicly documented**. The
+A device's HID report byte layout is often **not publicly documented**. The
 decoder is designed to derive the layout at runtime from the device's HID
 Report Map, but you should still capture a ground-truth sample to (a) confirm
 the device is plain HOGP and (b) build decoder test fixtures.
@@ -139,7 +145,7 @@ the device is plain HOGP and (b) build decoder test fixtures.
 
 Quick capture path with **nRF Connect for Mobile** (iOS/Android) — subject to caveat (1) above:
 
-1. Put the IST PRO into BLE pairing mode and **Connect** from nRF Connect.
+1. Put the device into BLE pairing mode and **Connect** from nRF Connect.
 2. Expand the **Human Interface Device** service (UUID `0x1812`).
 3. Record the **Report Map** characteristic (`0x2A4B`) — read its value and
    copy the full hex. This is the descriptor the decoder parses.
@@ -181,8 +187,8 @@ firmware-build CI for this repo is the next milestone (see `HANDOFF.md` §4).
   HOGP central is reimplemented with Zephyr's GATT client primitives
   (`bt_gatt_discover` / `bt_gatt_subscribe`), modeled on ZMK's own split
   central code (`app/src/split/bluetooth/central.c`).
-- **Why a runtime Report-Map parser.** Rather than hardcoding the IST PRO's
-  byte layout (unknown, and device-specific), the decoder parses the HID
+- **Why a runtime Report-Map parser.** Rather than hardcoding one device's
+  byte layout (often unknown, and device-specific), the decoder parses the HID
   Report Map at connect time to locate the X/Y/buttons/wheel fields. This works
   for any HOGP mouse and keeps the device-specific knowledge out of the code.
   A HID Boot Protocol fallback covers devices whose report map can't be parsed.
