@@ -32,9 +32,9 @@
         compatible = "zmk,ble-hid-host";
 
         /* Optional: only connect to a peer advertising this EXACT name.
-         * The IST PRO advertises as "IST PRO" (confirmed on-device, M1).
+         * Capture the real advertised name with nRF Connect (README section 8).
          * Leave commented to connect to the first discovered HOGP pointer. */
-        // device-name = "IST PRO";
+        // device-name = "My BLE Device";
     };
 
     /* Feed decoded motion into ZMK. Input-processors are attached in the
