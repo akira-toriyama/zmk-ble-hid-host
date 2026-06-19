@@ -488,6 +488,35 @@ Rollback firmware (restore the clean pre-FIX-B device):
 (RX 12/10 + §14 interval revert + logging, no FIX-B). FIX-B builds kept as
 `fixb_1200ms_logging.uf2` / `fixb_phase2_clamp_logging.uf2` (do NOT use for daily).
 
+## 17. RX buffers MAXED to 18 — tried on-device, NO benefit (2026-06-19)
+
+With RF/distance confirmed already optimal by the user and FIX-B failed (§16), the
+last free firmware lever was tested: **max the RX pool** —
+`CONFIG_BT_CTLR_RX_BUFFERS` 12→**18** (the max; controller PDU_RX = 3+18 = 21) and
+`CONFIG_BT_BUF_ACL_RX_COUNT_EXTRA` 10→**20** (host ACL = 1+20 = 21, matched so the
+host never bottlenecks the controller recycle). Built, **`.config` verified 18/20**,
+flashed (logging combo), and run against the immediate-aggressive-move repro.
+
+**Result — no meaningful change from the RX 12/10 baseline:**
+- 5× `reason 0x08` in ~27 s; survival between drops 4.1 / 6.5 / 4.1 / 9.6 s;
+  intervals ~5-10 s — statistically the same as RX 12/10's ~6-13 s (§9). The peer's
+  timeout stayed its own 2160 ms (no FIX-B; `FIX-B`/`clamping` lines = 0, confirming
+  a clean RX-only build).
+
+**Confirms §9/§13 exactly:** deeper pools raise BURST absorption only marginally and
+do **not** move the freeze; the steady-state RX-node recycle ceiling dominates even
+the immediate-burst case. **Reverted `.conf` to RX 12/10** (the committed baseline;
+RX-18 had no benefit to justify deviating). RX-18 build kept as
+`rollback/rx18_logging.uf2` (do NOT use).
+
+**FINAL on-device tally — every firmware lever is now exhausted on hardware:** RX
+depth (incl. max 18), thread-starvation (refuted), 2M/DLE/FORCE_MD, conn-interval
+(peer-vetoed), subscription pruning (flood is 100% id=2), FIX-B conn-param timeout
+(peer fights, §16). **The move-freeze under hard aggressive motion is a hardware
+ceiling — not fixable in stock firmware, period.** Only mitigations: behavioral
+(wait ~2-3 s after power-on before flailing; keep the link up — don't power-cycle the
+mouse often) + RF (already optimal here). Recommended firmware = RX 12/10 baseline.
+
 ## 14. Interval experiment RESULT — VETOED by the peer; mouse params revealed (2026-06-19)
 
 On-device test of §13's first experiment (interval widened to 15-30 ms + a PHY
