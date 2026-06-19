@@ -14,21 +14,26 @@ push will need `--force-with-lease`.
 
 > ## ⏭️ NEXT SESSION — START HERE
 >
-> **The move-freeze is a steady-state RX-node recycle-throughput ceiling** (single-
-> threaded host recycle, no HCI flow control — §13). Eliminating it cleanly is most
-> likely NOT possible in stock firmware. What is RULED OUT (don't retry): RX buffer
-> depth (§9), 2M PHY + DLE (§13), FORCE_MD (§13, inert on an RX-only host), and the
-> **connection-interval lever (§14 — VETOED on device: the IST PRO pins interval
-> 7.5 ms / latency 44 / timeout 2160 ms every connect; widening it made the freeze
-> occur MORE easily, so it was reverted).**
+> **VERDICT (2026-06-19, §15): the move-freeze has NO firmware cure — it is a hard
+> architectural ceiling. The last lever (subscription pruning) is now PROVEN dead,
+> AND a forensic re-read overturned the reconnect-window hypothesis: the freeze is
+> primarily STEADY-STATE, not a discovery-window failure.** ALL levers exhausted:
+> RX buffer depth (§9), thread-starvation (§9, refuted), 2M PHY + DLE (§13),
+> FORCE_MD (§13), connection-interval (§14, VETOED by peer + harmful), and
+> subscription pruning (§15 — `verify.log` shows the flood is 100% id=2; ids
+> 1/4/6/9 never notify; pruning removes 0 notifications). Root cause = single-
+> threaded controller RX-node recycle gated by the hard-coded
+> `ull_pdu_rx_alloc_peek(3)` ACK reserve (`lll_conn.c:1148`), no HCI flow control;
+> the only true fixes need a Nordic-LLL fork (forbidden) or peer cooperation
+> (impossible for a 3rd-party mouse).
 >
-> **The ONE untested lever left: subscription pruning** — subscribe only to the
-> motion report id=2 and see if it cuts the inbound notification rate (peer-
-> independent). First confirm the other 4 reports (ids 1/4/6/9) actually notify
-> during the flood (DBG "ignoring report" at hog_central.c:164); if they're idle,
-> pruning won't help and the move-freeze is a hardware ceiling → switch to
-> MITIGATION only (shorter supervision timeout via a central-forced
-> `bt_conn_le_param_update`, + antenna placement / TX +8 dBm). Details: §14.
+> **What remains is MITIGATION ONLY (none eliminate the steady-state drop):** ship
+> the proven-but-UNMERGED RX 12/10 improvement on this branch; free RF/antenna/
+> distance + TX +8 dBm first; then optionally FIX-B (central-forced shorter
+> supervision timeout = shorter blip, may be peer-rejected). Marginal firmware
+> levers C7 (drop notify during discovery) / B3 (skip report-map read on reconnect)
+> target the reconnect window, which the forensics say is NOT where this repro
+> fails — deprioritized. Full analysis + ranked proposal: **§15**.
 >
 > **SEPARATE open bug:** "idle ~1 h → dead, only a dongle re-plug revives" — see §12
 > (not yet investigated; owner asked to do it after the move-freeze).
@@ -491,3 +496,106 @@ remains:
 
 Capture: `/tmp/exp1.log` (143 lines: the `conn params updated` / `effective params`
 lines show 7.50 ms / lat 44 / 2160 ms; 6× reason 0x08).
+
+## 15. FINAL VERDICT — subscription pruning PROVEN dead; no firmware cure; freeze is STEADY-STATE (2026-06-19)
+
+Two decisive results this session: (1) the last untested lever is dead, proven
+from existing logs with **no flash**; (2) a 16-agent adversarial hunt
+(`wf_645d2eb1-4f8`) re-read the real source + logs and **overturned the
+reconnect-window hypothesis** — the move-freeze is dominantly STEADY-STATE.
+
+### 15a. Subscription pruning is INEFFECTIVE — proven from `verify.log` (no flash)
+
+The §14 gate ("do ids 1/4/6/9 notify during the flood?") is answered by the
+existing immediate-move capture, because the publish line AND the "ignoring report"
+line are BOTH `LOG_DBG` and the module was at DBG (5492 motion DBG lines present):
+
+- Published motion reports: **5492, ALL handle `h=49` (= id=2)**. No other handle
+  appears anywhere in the log.
+- `ignoring report` lines (= a non-pointer report id 1/4/6/9 notified): **0**.
+- Buttons fired (30× `buttons=0x0001`) and rode `h=49` (id=2), confirming §13.
+- The `ignoring report` source string existed at the verify.log-era commits
+  (`b7f6cce`, `ef1e623`) — so 0 means "never notified", not "line absent".
+
+⇒ The aggressive-motion flood is **100% id=2**; pruning to id=2 removes ZERO
+notifications. Pruning is **DEAD for the steady-state flood.** (It could still cut
+the reconnect *discovery* window from 5 reports to 1, but see 15c — the window is
+not where this repro fails.)
+
+### 15b. The reconnect-window hypothesis is WRONG — the freeze is STEADY-STATE
+
+The hunt's log-forensics (angle E), then adversarially corrected with
+full-precision timestamps on `verify.log`:
+
+- In **all 9 reconnect cycles the GATT discovery window COMPLETES** (`secured →
+  discovery done` ≈ 0.56–0.74 s every time). The window is dominated by the
+  un-prunable **377 ms report-map read** (`secured 57.010 → report-map parsed
+  57.387`), not the per-report round-trips — so "shrink the window" saves ~12%
+  (~67 ms), not 5×.
+- Every one of the 8 post-discovery `0x08` drops fires **4.6–12.7 s LATER, deep in
+  steady-state motion** (e.g. done `verify.log:3368` @00:01:05.014 → 0x08
+  @00:01:17.726 = 12.7 s). The link survives the whole window in every cycle and
+  dies seconds afterward.
+- The "wait a couple seconds → stable" clue is real but does **not** implicate the
+  discovery window; it reflects that aggressive motion *immediately* after power-on
+  reaches the steady-state recycle ceiling fastest.
+
+⇒ The dominant `0x08` trigger in the only repro logs is the **steady-state recycle
+ceiling**, NOT the reconnect window. Levers that only shrink the window (handle
+cache / drop-during-discovery / reconnect-pruning) target the wrong layer.
+
+### 15c. No cure — root cause re-confirmed end-to-end (source-verified)
+
+A `PDU_RX` node frees only after the host BT RX thread runs `bt_buf_get_rx(
+BT_BUF_ACL_IN, K_FOREVER)` (`hci_driver.c:458`), `hci_acl_encode` copies the PDU
+into a host ACL net_buf (`:459`), then `ll_rx_mem_release` recycles the node
+(`:535`). With **no HCI flow control** the Nordic central only ACKs (advances NESN)
+when `ull_pdu_rx_alloc_peek(3)` succeeds — a **hard-coded literal `3`**, not a
+Kconfig (`lll_conn.c:1148`). Under the id=2 flood the pool drains below 3 → peer
+retransmits → supervision timeout `0x08` (or 1–2-free NESN deadlock = silent
+permanent wedge, `r1.log:12528→12529`). **No stock Kconfig raises the
+single-threaded recycle rate.** True fixes (a separate RX-drain thread / forking
+the Nordic LLL reserve, or peer cooperation) are out of scope for stock firmware +
+a 3rd-party mouse. Adversarially-refuted non-fixes: handle caches (A1–A4: removing
+discovery removes zero over-air notifications), deeper pools (proven-dead #1),
+HCI flow control (inert/harmful in a combined `BT_LL_SW_SPLIT` build), all ZMK
+split-central levers (D: already maxed/equalled for us).
+
+### 15d. Ranked mitigations (none are cures; honest efficacy)
+
+1. **SHIP RX 12/10** (already on this branch, UNMERGED) — strict improvement (idle
+   rock-solid, permanent wedge gone). Strip the working-tree diagnostics first
+   (le_param/phy loggers, `ZMK_LOGGING_MINIMAL`, `USER_PHY_UPDATE`). No new device
+   work needed beyond what's proven. **Do this regardless.**
+2. **Free, no-flash RF complements (try FIRST):** shorten dongle↔trackball
+   distance, cut 2.4 GHz interference (USB3 hubs / Wi-Fi), reposition antenna; if
+   the board exposes it, TX **+8 dBm**. These raise retransmit-success headroom
+   before supervision expiry and cannot destabilize param negotiation.
+3. **FIX-B — central-forced shorter supervision timeout** (`bt_conn_le_param_update`
+   at `subscribe_pending` ~`hog_central.c:448-459`): request e.g.
+   `BT_LE_CONN_PARAM(6,12,44,100)` (timeout 1000 ms; don't go below
+   `(1+latency)×interval×2` ≈ 675 ms or the peer rejects). Converts a long freeze
+   into a shorter, faster-recovering blip — **does NOT remove drops**, and the IST
+   PRO pins timeout 2160 ms and may simply ignore it (it ignored the longer-timeout
+   request too); §14 also showed param-update churn can WORSEN reconnect, so issue
+   it ONCE, well after discovery-done (≈+500 ms), and only if the user still finds
+   the freeze duration unacceptable after #1+#2.
+4. **C7 / B3 (DEPRIORITIZED):** C7 = `if (disc_state != DISC_IDLE) return
+   BT_GATT_ITER_CONTINUE;` early-return in `notify_cb` (~`hog_central.c:178`); B3 =
+   cache the parsed `layout` addr-keyed (same-boot only) and skip the report-map
+   read on reconnect (`hog_central.c:234/374/519`, NEVER cache handles, restore
+   `layout_valid` after the L523/L743 clears). Both only shrink the reconnect
+   window — which 15b shows is not where this repro fails — and RX 12/10 already
+   killed the permanent wedge, so their marginal value is low. Implement only as
+   belt-and-suspenders / to A/B-confirm 15b on device.
+
+**Bottom line:** the move-freeze under hard sustained aggressive motion is a hard
+architectural ceiling, **weakly** (not strongly) mitigable. Deliverable = "a
+shorter, faster-recovering blip + a rock-solid idle link", not "no drops". Ship
+RX 12/10, try RF/distance first, layer FIX-B only if needed.
+
+Full hunt output: `wf_645d2eb1-4f8` →
+`/private/tmp/claude-501/.../tasks/wk584fdux.output` (5-angle dossier + adversarial
+verdicts). Key file:lines: root cause `lll_conn.c:1148`; recycle chain
+`hci_driver.c:458/459/535`; FIX-B hook `hog_central.c:448-459`; param-veto context
+`hog_central.c:649-656`; forensic timeline `verify.log:3368` vs `:3369/:4368`.
