@@ -662,21 +662,73 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	}
 }
 
+/* ── idle-reconnect reliability (#8): make the auto-reconnect scan self-healing ──
+ * Two surgical additions, both load-bearing for "放置してもペアリングを維持":
+ *  A1 retry — bt_le_scan_start() previously only LOG_ERR'd and returned, so a
+ *    single transient failure on the disconnected()->start_scan() path left the
+ *    central permanently deaf until a USB re-plug (matches the ORIGINAL "only a
+ *    re-plug revives it" report). Retrying from inside start_scan() protects every
+ *    caller (disconnected, connected-err, device_found create-fail). This is the
+ *    same code proven on device on branch fix/idle-1h-scan-retry.
+ *  Heartbeat — a 60 s INF line (NO verbose BT DBG, which has broken BLE timing
+ *    before) so a future idle death is finally localizable in the daily-use log:
+ *    if HB stops -> dongle/USB wedged; if HB continues with conn=0 + scan_fail
+ *    climbing -> central went deaf. Keep it until a real death is classified. */
+static uint32_t scan_starts;
+static uint32_t scan_fails;
+
+static void scan_retry_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (!default_conn) {
+		start_scan(); /* keep retrying until the scanner is actually running */
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_handler);
+
+static void heartbeat_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat_handler);
+static void heartbeat_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u",
+		k_uptime_get_32() / 1000U, default_conn ? 1 : 0,
+		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails);
+	k_work_reschedule(&heartbeat_work, K_SECONDS(60));
+}
+
 static void start_scan(void)
 {
+	/* CONTINUOUS scan (window == interval == 30 ms, 100% duty) so the mouse's
+	 * brief directed-advert reconnect burst on wake is caught on the FIRST advert,
+	 * not after several mouse power-cycles (the NEW 2026-06-20 "繰り返してたら接続"
+	 * symptom). The dongle is USB-powered, so the higher radio duty has no cost,
+	 * and scan only runs while default_conn == NULL (device_found early-returns
+	 * otherwise), so an established link is never perturbed. Keep ACTIVE (first-time
+	 * name discovery) and OPT_NONE (no FILTER_DUPLICATE: every advert must keep
+	 * arriving so a re-trigger after a failed connect still fires device_found). */
 	struct bt_le_scan_param sp = {
 		.type = BT_LE_SCAN_TYPE_ACTIVE,
 		.options = BT_LE_SCAN_OPT_NONE,
-		.interval = BT_GAP_SCAN_FAST_INTERVAL,
+		.interval = BT_GAP_SCAN_FAST_INTERVAL_MIN,
 		.window = BT_GAP_SCAN_FAST_WINDOW,
 	};
 	int err = bt_le_scan_start(&sp, device_found);
 
+	if (err == -EALREADY) {
+		return; /* already scanning -- fine, don't count as a failure */
+	}
 	if (err) {
-		LOG_ERR("scan start failed (%d)", err);
+		scan_fails++;
+		/* A1 FIX: previously this returned and the scanner was deaf forever.
+		 * Retry with a short backoff so a transient failure can't wedge it. */
+		LOG_ERR("scan start failed (%d) total_fail=%u -> retry in 1s", err,
+			scan_fails);
+		k_work_reschedule(&scan_retry_work, K_MSEC(1000));
 		return;
 	}
-	LOG_INF("scanning for a HOGP pointer...");
+	scan_starts++;
+	LOG_INF("scanning for a HOGP pointer... (epoch=%u)", scan_starts);
 }
 
 /* ───────────────────────── connection callbacks ────────────────────────── */
@@ -838,6 +890,7 @@ static void start_work_handler(struct k_work *work)
 		host_dev ? host_dev->name : "?",
 		name_filter ? name_filter : "<any HOGP pointer>");
 	start_scan();
+	k_work_reschedule(&heartbeat_work, K_SECONDS(60)); /* #8: arm idle heartbeat */
 }
 
 static K_WORK_DELAYABLE_DEFINE(start_work, start_work_handler);
