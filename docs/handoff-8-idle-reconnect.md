@@ -50,17 +50,26 @@
 > - **(C) USB side eats it** — `ble_hid_host_publish` (`ble_hid_host.c:139`) uses
 >   `input_report_*` K_NO_WAIT, which DROPS on a full input queue / USB-suspend-not-resumed.
 >
-> ## ⏭️ NEXT SESSION — START HERE (the decisive experiment)
-> Build a **counter** diagnostic (INF/counter ONLY — NEVER per-notification or BT DBG;
-> that breaks BLE timing — hard lesson). In `drivers/input/hog_central.c`:
-> 1. `static uint32_t rx_notif, pub_reports;` beside the `#8` counters (~L691-692).
-> 2. `rx_notif++;` in `notify_cb` **after** the `data == NULL` teardown check (~L186).
-> 3. `pub_reports++;` right after the `ble_hid_host_publish(...)` call (~L173).
-> 4. Append `rx_notif=%u pub=%u` to the 60 s heartbeat `LOG_INF` (~L708-710).
-> 5. (optional) print both in `disconnected()` too (short-lived zombies). **Do NOT reset them.**
+> ## ⏭️ NEXT SESSION — START HERE (now in OBSERVE mode)
+> **✅ The counter diagnostic is BUILT + FLASHED + LIVE (2026-06-21 18:30).** Commit
+> `d91b654` on `feat/reconnect-diagnostics`; logging uf2 sha
+> `6c4e62607117988ca6b0a293b49067d56d45c59b34ac9cde082f6755b6832ec5`. Verified: HB now
+> prints `… rx_notif=%u pub=%u` and the `disconnected:` line too. Normal use is fine.
+> **So the next session does NOT build — it ACCUMULATES + READS.** The owner runs the
+> dongle normally; every HB (60 s) + disconnect line lands in `~/zmk-logs/zmk-YYYY-MM-DD.log`
+> 24/7 (LaunchAgent, independent of any session). When a zombie/freeze happens, the owner
+> notes the time; ANY later session greps the counters around it — no live monitoring needed.
 >
-> Flash logging build, accumulate MANY motion-wake trials, read deltas across HB lines
-> spanning a zombie vs a healthy window:
+> What was added (for reference / if a rebuild is ever needed), in `drivers/input/hog_central.c`:
+> 1. `static uint32_t rx_notif, pub_reports;` declared before `report_work_handler` (so both
+>    use-sites compile — NOT beside the scan counters, which are defined later in the file).
+> 2. `rx_notif++;` in `notify_cb` **after** the `data == NULL` teardown check.
+> 3. `pub_reports++;` right after the `ble_hid_host_publish(...)` call.
+> 4. `rx_notif=%u pub=%u` appended to the 60 s heartbeat `LOG_INF` AND the `disconnected:` line.
+> 5. Counters are **never reset** (monotonic; deltas across lines are the signal).
+>
+> Accumulate MANY motion-wake / long-idle trials, read `rx_notif`/`pub` deltas across HB +
+> disconnect lines spanning a zombie vs a healthy window:
 > - `rx_notif` **FLAT** (conn=1 sub=5) → **(A) mouse silent** → not fixable by re-subscribe;
 >   candidate fix = detect "subscribed but 0 rx for N s" → force disconnect/re-pair to nudge it.
 > - `rx_notif` **CLIMBS** but `pub` **FLAT** → **(B) dongle drop** → add per-guard counters
