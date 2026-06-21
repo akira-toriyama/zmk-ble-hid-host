@@ -616,6 +616,20 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	if (default_conn) {
 		return;
 	}
+
+	/* #8 DIAGNOSTIC (remove after diagnosis): while scanning, log every advert
+	 * from a BONDED peer OR any DIRECTED advert (aimed at us). This reveals
+	 * whether Mouse A's motion-wake adverts actually reach us and whether the
+	 * source address matches the bond. Targeted (bonded || directed) so it can
+	 * NOT flood — a flood of INF logs perturbs BLE timing (hard lesson). */
+	if (addr_is_bonded(addr) || type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+		char ds[BT_ADDR_LE_STR_LEN];
+
+		bt_addr_le_to_str(addr, ds, sizeof(ds));
+		LOG_INF("ADV-seen %s type=%u rssi=%d bonded=%d", ds, type, rssi,
+			addr_is_bonded(addr) ? 1 : 0);
+	}
+
 	/* Only initiate to connectable advertising (skip scan responses). */
 	if (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
 	    type != BT_GAP_ADV_TYPE_EXT_ADV) {
