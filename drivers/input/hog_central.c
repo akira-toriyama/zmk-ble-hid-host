@@ -136,6 +136,13 @@ struct report_evt {
 K_MSGQ_DEFINE(report_msgq, sizeof(struct report_evt), 16, 4);
 static struct k_work report_work;
 
+/* #8 diag counters (NEVER reset — monotonic; deltas across HB/disconnect lines are
+ * the signal): rx_notif = GATT notifications received in notify_cb; pub_reports =
+ * reports actually forwarded to USB. Surfaced in the heartbeat + disconnect lines so
+ * a ZOMBIE reconnect (conn up, subscribed, but no report flow) is visible at INF. */
+static uint32_t rx_notif;
+static uint32_t pub_reports;
+
 static void report_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -171,6 +178,7 @@ static void report_work_handler(struct k_work *work)
 				evt.value_handle, report.dx, report.dy, report.wheel,
 				report.hwheel, (unsigned)report.buttons);
 			ble_hid_host_publish(host_dev, &report);
+			pub_reports++; /* #8 diag: reports actually forwarded to USB */
 		}
 	}
 }
@@ -184,6 +192,8 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 		params->value_handle = 0U; /* subscription torn down */
 		return BT_GATT_ITER_STOP;
 	}
+
+	rx_notif++; /* #8 diag: a real GATT notification arrived from the mouse */
 
 	struct hid_subscription *sub = CONTAINER_OF(params, struct hid_subscription, params);
 	struct report_evt evt;
@@ -705,9 +715,10 @@ static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat_handler);
 static void heartbeat_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u",
+	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u rx_notif=%u pub=%u",
 		k_uptime_get_32() / 1000U, default_conn ? 1 : 0,
-		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails);
+		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails,
+		rx_notif, pub_reports);
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60));
 }
 
@@ -791,7 +802,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	char s[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), s, sizeof(s));
-	LOG_INF("disconnected: %s (reason 0x%02x)", s, reason);
+	LOG_INF("disconnected: %s (reason 0x%02x) rx_notif=%u pub=%u", s, reason, rx_notif,
+		pub_reports);
 
 	if (default_conn != conn) {
 		return;
