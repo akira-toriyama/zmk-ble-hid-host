@@ -370,3 +370,101 @@ has no gap; all BT callbacks run on the BT RX workqueue (`CONFIG_BT_RECV_WORKQ_B
 - I (the assistant) mis-concluded several times on 2026-06-20 (zombie retraction;
   "mouse-side" verdict). The two-mice A/B + the ultra source verification are what
   finally pinned it. Trust the on-device diagnostic over any a-priori theory.
+
+---
+
+# 📒 Session record + operating guide for the NEXT Claude Code session (2026-06-21 PM)
+
+A fresh Claude Code session can resume from THIS section alone. Device is in **OBSERVE
+mode** with the counter diagnostic flashed; the owner uses the mouse normally and the
+LaunchAgent logs the counters 24/7. You do NOT rebuild or reflash unless the owner picks
+a direction (see "What the owner will report" below).
+
+## What happened this session (chronology)
+1. Built + flashed the `ADV-seen` diagnostic (`581d477`, uf2 sha `d1b3c136…`). Confirmed
+   booted; cleared the cached-resubscribe zombie regression that was on the device.
+2. On-device A/B trials (owner drives Mouse A "ドングルマウス"; Mouse B is the Mac's
+   "通常マウス"). **Result overturned the scan/PASSIVE theory** — see the ⭐LATEST section
+   at the top. Failure = **post-reconnect ZOMBIE** (conn=1 sub=5, full discovery, but
+   0/brief report flow), cured only by a **MOUSE power-cycle**.
+3. Built + flashed the **counter diagnostic** (`d91b654`, uf2 sha
+   `6c4e62607117988ca6b0a293b49067d56d45c59b34ac9cde082f6755b6832ec5`) = `581d477` +
+   `rx_notif`/`pub_reports` in the HB and disconnect lines. Verified live (HB at 18:31
+   showed `rx_notif=0 pub=0`). **This is what is on the device now.**
+4. Side-fix (unrelated): HID descriptor shift-count UB → `fix/hid-decode-shift-ub`
+   (`ce52e25`, off `main`, RED→GREEN plain+UBSan, `make test-ubsan`+CI, **UNPUSHED**).
+
+## Artifacts (all on `feat/reconnect-diagnostics` unless noted; nothing pushed/merged)
+| ref | what |
+|---|---|
+| `581d477` | `ADV-seen` diagnostic in `device_found` |
+| `d91b654` | **counter diagnostic** (`rx_notif`/`pub_reports`) — **flashed now** |
+| `d329c3a` / `5b29bde` | the ⭐LATEST re-scope + observe-mode handoff |
+| firmware | `canon/firmware/ble_hid_host_receiver-logging.uf2` (currently sha `6c4e6260…`) |
+| `fix/hid-decode-shift-ub` `ce52e25` | shift-UB fix (separate worktree `../zmk-ble-hid-host.wt-shift-ub`), UNPUSHED |
+| `~/bin/flash-ist-logging.sh` | one-shot flasher (waits for XIAO mount, board-guarded, mount-race-fixed) |
+| `~/zmk-logs/zmk-YYYY-MM-DD.log` | 24/7 serial capture (LaunchAgent `com.tommy.zmk-log`, 120-day) |
+
+## Monitoring method (re-arm verbatim in a new session)
+The owner likes a **persistent macOS notification when the mouse sleeps** (= "your turn
+to test"), and Claude pinged only on anomalies. Re-arm with a **persistent background
+Monitor** (note: use TODAY's date in the log filename):
+```bash
+LOG=~/zmk-logs/zmk-$(date +%F).log   # resolve to the literal current-day file in the Monitor cmd
+tail -n0 -F "$LOG" \
+| grep --line-buffered -E "disconnected:|create connection failed|scan start failed" \
+| while IFS= read -r line; do
+    clean=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*m//g')
+    case "$clean" in
+      *"reason 0x13"*)  # clean mouse sleep = a trial window opened -> notify the owner only
+        osascript -e 'display notification "ドングルマウスが寝ました。動かして結果(動く/ゾンビ/一瞬で固まる)を教えてください。" with title "ZMK #8: 寝た A=動かす" sound name "Glass"' >/dev/null 2>&1 ;;
+      *)  # 0x08 / 0x3e / errors -> surface to Claude (chat event)
+        printf '%s\n' "$clean" ;;
+    esac
+  done
+```
+- Run it via the **Monitor tool, `persistent: true`** (it ends at session end; re-arm each session).
+- macOS notification **persistence** is a one-time owner setting: System Settings → 通知 →
+  **Script Editor** → スタイル **「通知パネル」(Alert)**. (Already set this session.)
+- The notification only fires the Mac alert — it does NOT need Claude online; but the
+  Monitor (the chat-side ping) only runs while a session is live. The **LaunchAgent log
+  capture is independent and always-on**, so data accumulates regardless.
+
+## How to READ the counters (the whole point)
+Around any zombie/freeze the owner reports (note the time), look at the HB lines (every
+60 s) + the `disconnected:` line; the counters are monotonic so use **deltas** across lines:
+```bash
+~/bin/zmk-log around "HH:MM"                       # owner-friendly window query, OR:
+grep -E "rx_notif=|disconnected:|connected:|discovery done" ~/zmk-logs/zmk-$(date +%F).log \
+  | sed -E 's/\x1b\[[0-9;]*m//g'
+```
+Decision (a healthy window has BOTH climbing fast under motion + a live cursor):
+- zombie + `rx_notif` **delta ≈ 0** (conn=1 sub=5) → **(A) mouse silent** → not a dongle
+  forward bug; candidate dongle workaround = detect "subscribed but rx_notif flat for N s"
+  → `bt_conn_disconnect()` to force a fresh reconnect (UNPROVEN — a link bounce may not
+  equal the mouse's internal reset; and idle vs zombie is ambiguous because no-motion also
+  = rx_notif flat, so any auto-bounce must be gated carefully to not kill a healthy idle link).
+- `rx_notif` **climbs** but `pub` **flat** → **(B) dongle drops in `report_work_handler`**
+  → add per-guard counters `drop_layout`/`drop_id`/`drop_decode` at `hog_central.c:147/163/169`
+  to localize, then fix that guard. **Fully fixable on the dongle.**
+- **both climb** + dead cursor → **(C) USB side** (ZMK input queue full / USB suspend) —
+  different layer (`ble_hid_host.c` publish / ZMK USB-HID), not this driver's BLE path.
+
+## What the owner will report next — and what to do
+The owner expects the observation to resolve toward one of two directions:
+
+- **「採用」(adopt) — this version/behaviour is acceptable, keep it.** Likely phrasing:
+  *"採用でいい / もう問題ない / これで使う"* (maybe with how long observed / how rare the zombie).
+  → Action: build a **clean PRODUCTION (non-logging) variant** = strip BOTH diagnostics
+  (`ADV-seen` 581d477 + counters d91b654) from `device_found`/`notify_cb`/`report_work_handler`/
+  HB/disconnect, build `build-zmk.sh ist` (no `--logging`), flash the default uf2, and
+  consider a PR to `main`. (The diagnostics are harmless INF/counters, but production should
+  be clean.) Confirm with the owner before flashing.
+- **「不具合」(defect) — it still zombies/freezes.** Likely phrasing:
+  *"またゾンビった / 一瞬で固まった、だいたい HH:MM、動かした(or 動かしてない)"*.
+  → Action: read the `rx_notif`/`pub` counters around HH:MM (recipe above) → classify A/B/C →
+  implement the corresponding fix. **Accumulate several samples before concluding** (owner's
+  explicit method: physical, hard to reproduce, never conclude from one result).
+
+Either way: report what the counters show with evidence (file:line/log timestamps), don't
+assert a verdict from a single trial, and keep the owner's "accumulate patiently" rule.
