@@ -253,13 +253,16 @@ shows a repeating `err 4` cycle.
 
 ## Latent bugs found during review (INDEPENDENT of #8 — fix on a separate branch off `main`)
 
-- **MEDIUM (real UB) — HID-descriptor shift-count UB.** `report_size` (uint8_t) is never clamped
-  to ≤32, so a peer Report Map with `REPORT_SIZE > 32` makes the decoder do `x << i` with `i≥32`
-  (C undefined behavior) for X/Y/wheel/hwheel, button stride, and keyboard key width. Reachable
-  from a malfunctioning/hostile bonded peer (IST PRO itself uses 8/12/16-bit, so latent). Fix:
-  clamp `≤32` at parse time in `set_field` (`hid_report_parser.c:188`), button width (`:216`),
-  key width (`:278`); defensive guard at top of `extract()` (`hid_report_decode.c:29`). Add a
-  `REPORT_SIZE 64` regression case under `-fsanitize=undefined`. (`item_s()` already guards; `extract()` is the unguarded twin.)
+- ✅ **DONE — HID-descriptor shift-count UB (was MEDIUM, real UB).** Fixed on branch
+  **`fix/hid-decode-shift-ub`** (commit `ce52e25`, off `main`, **unpushed — needs PR approval**).
+  `report_size > 32` made the decoder do `x << i` with `i≥32` (UB) for X/Y/wheel/hwheel, the
+  button stride, and keyboard keys. Fix (defense in depth): parse-time reject of size 0 / >32 in
+  `set_field`, button width, keycode-entry width; decode-time guard in `extract()` + button-loop
+  cap at 32. TDD: 4 new cases in `tests/parser/test_runner.c`, verified RED (11 fails) → GREEN
+  under plain **and** `-fsanitize=undefined`; added `make test-ubsan` + a UBSan step to
+  `hosttest.yml`. Worked in a linked worktree at `../zmk-ble-hid-host.wt-shift-ub`. NOTE: macOS
+  `-fsanitize=address` runtime HANGS (spins at 100% CPU) — use UBSan only locally; ASan is fine on
+  the Linux CI but the target deliberately uses UBSan only for portability.
 - **MEDIUM — `device_found` create-fail doesn't NULL `default_conn`** (`hog_central.c:672-676`).
   Benign today (create takes no ref on error) but fragile = potential permanent "deaf central".
   Add `default_conn = NULL;` + replace the immediate `start_scan()` with a `scan_retry_work` backoff.
