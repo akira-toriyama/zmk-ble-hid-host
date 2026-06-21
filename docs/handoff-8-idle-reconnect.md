@@ -1,9 +1,19 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> **Status (2026-06-21): root cause re-scoped, fix PLANNED, NOT implemented.**
-> The dongle currently has a REGRESSION flashed on it (see Failure Mode A). The
-> next session should start with the diagnostic build below. **Nothing is pushed
-> or merged.** Read this top-to-bottom before touching code.
+> **Status (2026-06-21): Step 1 DONE — diagnostic firmware BUILT, committed, and
+> flashable on demand. NOT yet flashed (user chose to wait). Steps 2–4 pending.**
+> - Diagnostic edit committed on `feat/reconnect-diagnostics` as `581d477`
+>   (the `ADV-seen` log in `device_found`).
+> - Logging firmware built & verified: `canon/firmware/ble_hid_host_receiver-logging.uf2`
+>   (sha256 `d1b3c1364d1a97cb18f8b13e84c4c045367021d883b3139113db5b3a1437fc81`).
+>   The `ADV-seen %s type=%u …` string is confirmed baked into `zmk.elf`.
+> - **One-shot flasher: `~/bin/flash-ist-logging.sh`** — double-tap the dongle
+>   reset, run it (waits for the XIAO mount, sanity-checks the board, copies the
+>   uf2). Or tell Claude "焼いて".
+> - This build is off `main` (no cached-resubscribe) → flashing it also clears the
+>   Mode A zombie regression currently on the device.
+> - The dongle currently STILL has the REGRESSION flashed (not replaced until the
+>   flash happens). **Nothing is pushed or merged.** Read this top-to-bottom first.
 
 ---
 
@@ -176,6 +186,10 @@ is worth mirroring as insurance against a key-mismatch loop.
   (`INFO_UF2.TXT` contains "XIAO") → `cp` the uf2 → reboots. The `cp` needs the Bash
   tool's `dangerouslyDisableSandbox`. `canon/scripts/flash-watch.sh` is imprint-only
   (would flash the wrong firmware) — flash the ist uf2 manually.
+- **One-shot flasher (this work):** `~/bin/flash-ist-logging.sh` — waits for the XIAO
+  mount, refuses non-XIAO boards (`INFO_UF2.TXT` guard), prints the firmware sha, then
+  copies `ble_hid_host_receiver-logging.uf2`. Run it in a terminal, or have Claude run
+  it (with `dangerouslyDisableSandbox`). Rebuild the uf2 with `build-zmk.sh ist --logging`.
 - **LESSON:** never add verbose BT DBG logging (it breaks BLE timing). Keep
   diagnostics targeted + INF-level.
 
@@ -193,17 +207,27 @@ is worth mirroring as insurance against a key-mismatch loop.
 |---|---|---|
 | `main` (`b42b608`) | #14 continuous-scan + A1 retry. **No** cached-resubscribe. Clean baseline. | build the diagnostic on top |
 | `feat/cached-reconnect-resubscribe` (`9cbc3ec`) | my cached-resubscribe = **Failure Mode A**. **Currently FLASHED on the device.** | do NOT merge; the Step-1 flash replaces it |
-| `feat/reconnect-diagnostics` (off `main`) | where the diagnostic edit is being placed | continue here |
+| `feat/reconnect-diagnostics` (`581d477`, off `main`) | the `ADV-seen` diagnostic edit (committed). Logging uf2 built from this. | flash & gather data; after diagnosis, drop the diagnostic + implement Step 3 |
 
-## ❌ Unachieved (explicit — do not leave implicit)
+## Progress / Unachieved (explicit — do not leave implicit)
 
-- ❌ Diagnostic firmware **not built / not flashed**.
-- ❌ Failure Mode **B root cause not yet confirmed on device** (3 candidates open).
-- ❌ The fix is **not implemented**.
-- ❌ The **zombie regression (Mode A) is still on the device** → Mouse A on the dongle
-  is currently broken until the next (main-based) flash. (User is working on Mouse B / Mac meanwhile.)
+- ✅ Diagnostic firmware **built, verified (`ADV-seen` in `zmk.elf`), committed** (`581d477`),
+  and **flashable on demand** via `~/bin/flash-ist-logging.sh`.
+- ⏸️ **NOT yet flashed** — user chose to wait ("まだ待機で / いつでも焼ける状態にして").
+  The flasher is ready; flashing is one action away.
+- ❌ Failure Mode **B root cause not yet confirmed on device** (3 candidates open) —
+  needs the flash + the Mouse-A sleep→motion test (Step 2).
+- ❌ The fix is **not implemented** (Step 3, data-driven, blocked on Step 2 data).
+- ❌ The **zombie regression (Mode A) is still on the device** until the flash happens →
+  Mouse A on the dongle is broken meanwhile. (User is on Mouse B / Mac.)
 - ❌ #8 **not resolved**; not closed.
 - ❌ Nothing **pushed/merged** (needs owner approval).
+
+### Exact resume point for the next session
+1. Flash: double-tap the dongle reset, then `~/bin/flash-ist-logging.sh` (or "焼いて").
+2. Confirm Mouse A auto-reconnects; let it deep-sleep (`disconnected … reason 0x13` + `conn=0`).
+3. Move Mouse A firmly ~10 s; note the time; `~/bin/zmk-log around "HH:MM"`.
+4. Match the `ADV-seen … type=… bonded=…` outcome to the Step-2 table → apply Step 3 fix.
 
 ## Context
 
