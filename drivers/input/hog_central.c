@@ -142,6 +142,10 @@ static struct k_work report_work;
  * a ZOMBIE reconnect (conn up, subscribed, but no report flow) is visible at INF. */
 static uint32_t rx_notif;
 static uint32_t pub_reports;
+/* #8 Fix-A diag: last negotiated peripheral latency (0xFFFF = not connected).
+ * Surfaced in the heartbeat so a zombie reconnect shows whether the latency clamp
+ * to 0 took (fixed) or the peer NAK'd back to 44 (clamp insufficient -> sniff next). */
+static uint16_t cur_latency = 0xFFFF;
 
 static void report_work_handler(struct k_work *work)
 {
@@ -457,13 +461,27 @@ static void subscribe_pending(struct bt_conn *conn)
 		struct bt_conn_info info;
 		disc_state = DISC_IDLE;
 		LOG_INF("discovery done: subscribed to %u report(s)", sub_count);
-		/* OBSERVE-only: log the EFFECTIVE link params even if the peer never
-		 * sent a param-update (then le_param_updated never fires). interval unit
-		 * 1.25 ms, timeout unit 10 ms. */
+		/* OBSERVE: log the EFFECTIVE link params even if the peer never sent a
+		 * param-update. interval unit 1.25 ms, timeout unit 10 ms. */
 		if (bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE) {
+			cur_latency = info.le.latency; /* #8 Fix-A diag: surface in heartbeat */
 			LOG_INF("effective params @disc-done: interval %u.%02u ms, latency %u, timeout %u ms",
 				(info.le.interval * 5U) / 4U, ((info.le.interval * 5U) % 4U) * 25U,
 				info.le.latency, info.le.timeout * 10U);
+		}
+		/* #8 Fix-A: actively re-drive the link to latency 0 after discovery, the
+		 * way a macOS host does -- denies the peer the long skip-window that, after
+		 * a DEEP sleep, correlates with the "connected but not streaming" zombie.
+		 * Low risk: -EALREADY if already there; if the peer NAKs nothing changes. */
+		{
+			struct bt_le_conn_param *np = BT_LE_CONN_PARAM(6, 12, 0, 400);
+			int perr = bt_conn_le_param_update(conn, np);
+
+			if (perr && perr != -EALREADY) {
+				LOG_WRN("param re-drive (latency 0) request failed (%d)", perr);
+			} else {
+				LOG_INF("param re-drive requested: latency 0, timeout 4000 ms");
+			}
 		}
 		return;
 	}
@@ -715,10 +733,10 @@ static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat_handler);
 static void heartbeat_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u rx_notif=%u pub=%u",
+	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u rx_notif=%u pub=%u lat=%u",
 		k_uptime_get_32() / 1000U, default_conn ? 1 : 0,
 		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails,
-		rx_notif, pub_reports);
+		rx_notif, pub_reports, cur_latency);
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60));
 }
 
@@ -814,6 +832,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	pending_count = 0;
 	pending_idx = 0;
 	disc_state = DISC_IDLE;
+	cur_latency = 0xFFFF; /* #8 Fix-A diag: latency n/a while disconnected */
 	/* Invalidate the peer's layout the instant the link drops: reports still
 	 * queued (or arriving before the next peer's report map is parsed) must NOT
 	 * be decoded against a stale layout -- critical when reconnecting to a
@@ -833,15 +852,31 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	start_scan(); /* auto-reconnect: re-scan, match the bonded peer, re-discover */
 }
 
-/* OBSERVE-only: log the FINAL negotiated link params (no behavior change). The
- * mouse (peripheral) may send an L2CAP conn-param-update-request after connect;
- * with no le_param_req registered Zephyr auto-accepts it, so the real
- * supervision timeout is otherwise invisible. Fires once per (re)negotiation --
+/* #8 Fix-A: clamp the peer's requested peripheral latency to 0. The IST PRO asks
+ * for latency 44 on every (re)connect; after a DEEP sleep that long skip-window
+ * correlates with a "connected but not streaming" zombie (reports stop arriving
+ * though the link stays up, with no supervision timeout). macOS, which is immune,
+ * drives HID links toward latency 0. Accept the peer's interval/timeout but force
+ * latency 0 (floor the timeout for safety). Also actively re-driven after discovery
+ * in subscribe_pending(). PLAUSIBLE, not proven: if the peer NAKs, the heartbeat
+ * 'lat=' field still shows 44 and the zombie persists -> escalate to an OTA sniff. */
+static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
+{
+	ARG_UNUSED(conn);
+	param->latency = 0U;
+	if (param->timeout < 100U) { /* keep >= 1 s supervision (unit 10 ms) */
+		param->timeout = 400U;
+	}
+	return true;
+}
+
+/* OBSERVE: log the FINAL negotiated link params. Fires once per (re)negotiation,
  * NOT per-PDU. interval unit = 1.25 ms, timeout unit = 10 ms. */
 static void le_param_updated(struct bt_conn *conn, uint16_t interval,
 			     uint16_t latency, uint16_t timeout)
 {
 	ARG_UNUSED(conn);
+	cur_latency = latency; /* #8 Fix-A diag: track effective latency for the heartbeat */
 	LOG_INF("conn params updated: interval %u.%02u ms, latency %u, timeout %u ms",
 		(interval * 5U) / 4U, ((interval * 5U) % 4U) * 25U, latency, timeout * 10U);
 }
@@ -860,6 +895,7 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
 	.security_changed = security_changed,
+	.le_param_req = le_param_req,
 	.le_param_updated = le_param_updated,
 	.le_phy_updated = le_phy_updated,
 };
