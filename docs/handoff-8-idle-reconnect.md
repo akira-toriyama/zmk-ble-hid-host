@@ -1,19 +1,94 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> **Status (2026-06-21): Step 1 DONE — diagnostic firmware BUILT, committed, and
-> flashable on demand. NOT yet flashed (user chose to wait). Steps 2–4 pending.**
-> - Diagnostic edit committed on `feat/reconnect-diagnostics` as `581d477`
->   (the `ADV-seen` log in `device_found`).
-> - Logging firmware built & verified: `canon/firmware/ble_hid_host_receiver-logging.uf2`
->   (sha256 `d1b3c1364d1a97cb18f8b13e84c4c045367021d883b3139113db5b3a1437fc81`).
->   The `ADV-seen %s type=%u …` string is confirmed baked into `zmk.elf`.
-> - **One-shot flasher: `~/bin/flash-ist-logging.sh`** — double-tap the dongle
->   reset, run it (waits for the XIAO mount, sanity-checks the board, copies the
->   uf2). Or tell Claude "焼いて".
-> - This build is off `main` (no cached-resubscribe) → flashing it also clears the
->   Mode A zombie regression currently on the device.
-> - The dongle currently STILL has the REGRESSION flashed (not replaced until the
->   flash happens). **Nothing is pushed or merged.** Read this top-to-bottom first.
+> # ⭐ LATEST (2026-06-21 PM) — READ THIS FIRST; the scan theory below is OVERTURNED
+>
+> Diagnostic firmware (`581d477` = main + `ADV-seen` log, logging build, sha
+> `d1b3c136…`) was **flashed and tested ON-DEVICE today**. The result re-scopes #8
+> **again** and kills the "scan / directed-advert / PASSIVE" theory in the TL;DR +
+> "THE PLAN" sections below (kept only as history). **Investigation CONTINUES across
+> sessions** — owner's method (IMPORTANT): *do NOT conclude from one result; the
+> trigger is physical and hard to reproduce; accumulate many results patiently.*
+>
+> ## The corrected finding (the smoking gun)
+> On a **motion-wake reconnect** the dongle does everything right at the BLE/GATT
+> layer — catches the advert, `connected`, `secured (level 2)`, full GATT discovery,
+> `discovery done: subscribed to 5 report(s)` (ids 1/2/6/4/9), `conn=1 sub=5` — **yet
+> the cursor is dead ("zombie"), or moves a moment then freezes.** Only a **MOUSE
+> power-cycle** gives a working link. The INF log of a ZOMBIE reconnect is identical
+> to a WORKING one (the only motion/forward evidence is `LOG_DBG`, suppressed at the
+> default INF level). **So the failure is ABOVE the CCC-subscribe step — in HID
+> report-notification FLOW, not in scan/connect/discovery.** It is NOT a zombie when
+> freshly working (13:24 user-confirmed cursor moves at conn=1) — it appears on the
+> *reconnect after the mouse deep-sleeps*.
+>
+> The flashed `.config` ALREADY has the RX mitigation (`BT_CTLR_RX_BUFFERS=12`,
+> `BT_BUF_ACL_RX_COUNT_EXTRA=10`, `BT_GATT_AUTO_RESUBSCRIBE=n`) → "raise RX / it's the
+> move-freeze" is NOT this bug. Distinct from the CLOSED aggressive-move freeze
+> (`investigation-reconnect-freeze.md`: 0x08 under hard motion) and from that doc's
+> §12 idle-death (which needs a **DONGLE re-plug**; today's needs a **MOUSE** cycle).
+>
+> ## On-device truth table (2026-06-21 — NOT conclusive; accumulate more)
+> | stimulus after the mouse sleeps | cursor | log |
+> |---|---|---|
+> | A: move @14:39:42 | ❌ ZOMBIE | full discovery+sub, conn=1 sub=5, zero motion |
+> | A: move SLOWLY @14:54:16 | ⚠️ moved a moment → FROZE | full discovery+sub; flow starts then stops |
+> | B: MOUSE power-cycle @14:42:12 | ✅ works | identical reconnect, cursor live |
+> | (freshly connected, 13:24) | ✅ works | conn=1, no zombie |
+>
+> Log forensics — 12 disconnect/reconnect cycles since the 12:37:10 boot: **EVERY
+> advert was `type=0` (ADV_IND); ZERO `type=1` (directed) EVER** → "scanner misses
+> directed adv" is DEAD for this peer. `scan_fail=0`; **12/12 reached "subscribed to
+> 5 reports"**. Disconnects: `0x13`×8 (clean mouse sleep), `0x08`×4 (supervision
+> timeout; some self-heal in <2 s). Evidence: `~/zmk-logs/zmk-2026-06-21.log`.
+>
+> ## Three candidate mechanisms (the NEXT diagnostic decides which)
+> - **(A) Mouse silent** — peer doesn't resume HID notifications after reconnect (no
+>   ATT notifications arrive). Matches "only a MOUSE power-cycle fixes it." Mouse/link side.
+> - **(B) Dongle drops in the work handler** — `report_work_handler` silently
+>   `continue`s at `!layout_valid` (`hog_central.c:147`), id-mismatch (`:163`), or
+>   `decode != 0` (`:169`) → publishes nothing though conn=1 sub=5.
+> - **(C) USB side eats it** — `ble_hid_host_publish` (`ble_hid_host.c:139`) uses
+>   `input_report_*` K_NO_WAIT, which DROPS on a full input queue / USB-suspend-not-resumed.
+>
+> ## ⏭️ NEXT SESSION — START HERE (the decisive experiment)
+> Build a **counter** diagnostic (INF/counter ONLY — NEVER per-notification or BT DBG;
+> that breaks BLE timing — hard lesson). In `drivers/input/hog_central.c`:
+> 1. `static uint32_t rx_notif, pub_reports;` beside the `#8` counters (~L691-692).
+> 2. `rx_notif++;` in `notify_cb` **after** the `data == NULL` teardown check (~L186).
+> 3. `pub_reports++;` right after the `ble_hid_host_publish(...)` call (~L173).
+> 4. Append `rx_notif=%u pub=%u` to the 60 s heartbeat `LOG_INF` (~L708-710).
+> 5. (optional) print both in `disconnected()` too (short-lived zombies). **Do NOT reset them.**
+>
+> Flash logging build, accumulate MANY motion-wake trials, read deltas across HB lines
+> spanning a zombie vs a healthy window:
+> - `rx_notif` **FLAT** (conn=1 sub=5) → **(A) mouse silent** → not fixable by re-subscribe;
+>   candidate fix = detect "subscribed but 0 rx for N s" → force disconnect/re-pair to nudge it.
+> - `rx_notif` **CLIMBS** but `pub` **FLAT** → **(B) dongle drop** → add per-guard counters
+>   `drop_layout`/`drop_id`/`drop_decode` at `:147/:163/:169` to localize, then fix that guard.
+> - **both climb** + dead cursor → **(C) USB side** (ZMK input queue / USB suspend) — other layer.
+>
+> ## Ruled out today (don't re-investigate)
+> scan ACTIVE↔PASSIVE; directed-advert miss (`BT_SCAN_WITH_IDENTITY=y`; only ADV_IND ever);
+> address/bond mismatch (security reaches L2, discovery completes, `bonded=1` every time); RX
+> depth / AUTO_RESUBSCRIBE (already 12/10/n); the CLOSED aggressive-move freeze (0x08 under hard
+> motion — today's zombie HOLDS the link with no 0x08).
+>
+> ## Session tooling (re-arm next session)
+> - Serial capture LaunchAgent `com.tommy.zmk-log` → `~/zmk-logs/zmk-YYYY-MM-DD.log` (120 d).
+>   Query: `~/bin/zmk-log around "HH:MM"`. Flasher: `~/bin/flash-ist-logging.sh`.
+> - This session ran a live monitor that fired a **persistent macOS notification on each
+>   `0x13` sleep** (pings the owner when a trial window opens). Re-arm: `tail -n0 -F <log> |
+>   grep --line-buffered -E "disconnected:|ADV-seen|connected:|scanning for a HOGP" | while
+>   read l; do echo "$l"; case "$l" in *"reason 0x13"*) osascript -e 'display notification …';;
+>   esac; done`. Persistence = System Settings → 通知 → Script Editor → "通知パネル(Alert)".
+> - Unrelated fix shipped: HID shift-count UB on `fix/hid-decode-shift-ub` (`ce52e25`, off
+>   `main`, **UNPUSHED**, needs PR approval) — details in "Latent bugs" below.
+>
+> **Nothing pushed/merged. #8 OPEN.**
+>
+> ---
+> <details><summary>History below (2026-06-21 AM and earlier) — the scan/PASSIVE theory,
+> now SUPERSEDED by the on-device results above. Kept for context only.</summary></details>
 
 ---
 
