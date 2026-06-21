@@ -229,6 +229,53 @@ is worth mirroring as insurance against a key-mismatch loop.
 3. Move Mouse A firmly ~10 s; note the time; `~/bin/zmk-log around "HH:MM"`.
 4. Match the `ADV-seen … type=… bonded=…` outcome to the Step-2 table → apply Step 3 fix.
 
+## Step-3 prepared fixes (verified by 2026-06-21 code review — apply by ADV-seen outcome)
+
+ZMK refs re-verified at `ff09f2d0` (handoff's line cites were CORRECT): `central.c:877-883`
+directed branch (`ADV_DIRECT_IND -> split_central_eir_found(addr)`, no AD parse), `central.c:911-912`
+PASSIVE scan, `peripheral.c:64-68` bonded re-adv = `BT_LE_ADV_CONN_DIR[_LOW_DUTY]`. Generated
+`.config` confirms `BT_SCAN_WITH_IDENTITY=y`, `BT_PRIVACY` off, `BT_FILTER_ACCEPT_LIST` off.
+NOTE: the address handed to `device_found` is ALREADY resolved to the peer identity
+(`scan.c:638-645` `bt_lookup_id_addr`), so `addr_is_bonded` compares identity↔identity;
+`bt_addr_le_cmp` compares the type byte AND the value.
+
+| ADV-seen outcome | Root cause | Fix (verified anchors) |
+|---|---|---|
+| `type=1 bonded=1` (most likely) | candidate 1 (scan-stop→create race) / 3 (ACTIVE) | (a) **directed short-circuit**: on `type==ADV_DIRECT_IND && addr_is_bonded`, skip `bt_data_parse`/`ai.match`/`last_failed` cooldown → straight to the existing `bt_le_scan_stop()`+`bt_conn_le_create()` (gate at `hog_central.c:640-653`; mirror ZMK `central.c:880-882`). (b) **PASSIVE scan** when a bond exists (`start_scan` sp struct `hog_central.c:724-729`; keep ACTIVE only for first-time pairing). **Keep `.options=BT_LE_SCAN_OPT_NONE`** — do NOT adopt the `BT_LE_SCAN_PASSIVE` macro (it sets `OPT_FILTER_DUPLICATE`, which breaks our re-trigger-after-failed-connect). Must still `bt_le_scan_stop()` before create. |
+| `type=1 bonded=0` | candidate 2 (addr/identity mismatch) | NOT a scan/connect fix; accept-list does NOT help (same key). FIRST **widen the diagnostic** to dump the stored bond addr beside the AdvA (`bond_match_cb`/new `log_first_bond_cb`, `hog_central.c:547-562`). If **type-only** mismatch on a directed advert → value-only gate used ONLY for `type==1`. If the **value** differs → re-pair. |
+| nothing seen | candidate 3 / controller not delivering | (a) **PASSIVE** first (cheap). (b) LAST RESORT Plan B: `CONFIG_BT_FILTER_ACCEPT_LIST=y` + `bt_conn_le_create_auto()` (removes the stop→create dead window; `FAL_SIZE=8` already present). Confirm with a BLE sniffer the mouse actually emits. Does NOT fix an addr mismatch. |
+
+**Insurance (ZMK #3377/#3385 `bt_unpair`+`AUTH_FAIL` in `security_changed`)**: do **NOT** pre-stage.
+`bt_unpair` is a permanent bond wipe; gate strictly on `BT_SECURITY_ERR_PIN_OR_KEY_MISSING`
++ a repeat-count, never on generic failure. `CONFIG_BT_SMP_ENFORCE_MITM=y` vs the Just-Works
+NoInputNoOutput peer is a footgun (could itself loop security failures). Only add if the log
+shows a repeating `err 4` cycle.
+
+## Latent bugs found during review (INDEPENDENT of #8 — fix on a separate branch off `main`)
+
+- **MEDIUM (real UB) — HID-descriptor shift-count UB.** `report_size` (uint8_t) is never clamped
+  to ≤32, so a peer Report Map with `REPORT_SIZE > 32` makes the decoder do `x << i` with `i≥32`
+  (C undefined behavior) for X/Y/wheel/hwheel, button stride, and keyboard key width. Reachable
+  from a malfunctioning/hostile bonded peer (IST PRO itself uses 8/12/16-bit, so latent). Fix:
+  clamp `≤32` at parse time in `set_field` (`hid_report_parser.c:188`), button width (`:216`),
+  key width (`:278`); defensive guard at top of `extract()` (`hid_report_decode.c:29`). Add a
+  `REPORT_SIZE 64` regression case under `-fsanitize=undefined`. (`item_s()` already guards; `extract()` is the unguarded twin.)
+- **MEDIUM — `device_found` create-fail doesn't NULL `default_conn`** (`hog_central.c:672-676`).
+  Benign today (create takes no ref on error) but fragile = potential permanent "deaf central".
+  Add `default_conn = NULL;` + replace the immediate `start_scan()` with a `scan_retry_work` backoff.
+- **MEDIUM — cooldown writes `last_failed_addr` for bonded peers** (`security_changed` `:780-781`),
+  dead state today (bonded path is cooldown-exempt). Gate the copy on `!addr_is_bonded(...)`.
+- **LOW** — `sub_count` cross-workqueue read without the `layout_valid` fence discipline (benign on
+  single-core nRF52840; document that `layout_valid=false` at disconnect is the real guard).
+  `EXT_ADV` accepted by the type filter but connect uses legacy `BT_CONN_LE_CREATE_CONN` (peer is
+  legacy; drop `EXT_ADV` from `:635`). No backoff on repeated create-fail respin.
+- **INFO** — `BT_SMP_ENFORCE_MITM=y` with the Just-Works NoInputNoOutput peer is benign (IO-cap
+  degrades to Just Works + `BT_SMP_ALLOW_UNAUTH_OVERWRITE=y`); worth a one-line code comment.
+
+Positive findings (verified-correct, do not re-investigate): heartbeat/scan-retry self-reschedule
+has no gap; all BT callbacks run on the BT RX workqueue (`CONFIG_BT_RECV_WORKQ_BT=y`) so the
+`scan_stop`/`create`/`gatt_*` calls are in a legal sleepable context; msgq handoff is `K_NO_WAIT`.
+
 ## Context
 
 - Roadmap #12 (single-dongle integration / M6) needs robust bonded reconnect too,
