@@ -150,15 +150,15 @@ static uint16_t cur_latency = 0xFFFF;
 /* #8 auto-recover (path #2): the zombie (reconnect succeeds + an initial burst of
  * reports arrives, then rx_notif goes flat while the LL link stays up) is cured by a
  * fresh reconnect -- owner-confirmed 2026-06-22: a DONGLE re-plug revives it with NO
- * mouse power-cycle. So detect it and force a fresh reconnect ourselves. Detection is
- * gated to deep-sleep wakes (reconnect after a >=ZR_DEEP_MS gap) and to recovery
- * bounces, so a genuine idle (no reconnect) and a light bounce (short gap) never
- * re-arm -> no idle/bounce loop. ZR_WINDOW_MS after the reconnect, if rx_notif climbed
+ * mouse power-cycle. So detect it and force a fresh reconnect ourselves. Detection arms
+ * on EVERY reconnect: the zombie is PROBABILISTIC, not duration-gated (a 79s sleep
+ * zombied while a 78s one didn't, so the old >=90s deep-gate MISSED zombies -- removed).
+ * Reconnect storms are safe: each reconnect k_work_reschedule()s the single check, so only
+ * the post-storm check fires (no bounce spam). ZR_WINDOW_MS after the reconnect, if rx_notif climbed
  * < ZR_MIN_RX (a zombie only ever shows the ~35 burst), bt_conn_disconnect to force a
  * reconnect, up to ZR_MAX_BOUNCE times, then give up until the next wake. v1 = LIGHT
  * bounce (no sys_reboot) -- also tests whether a dongle-initiated reconnect (not a full
  * reboot) clears the zombie. INF logging only (NO verbose BT DBG, which breaks timing). */
-#define ZR_DEEP_MS    90000U  /* reconnect must follow a >=90 s disconnect to be a deep-sleep wake */
 #define ZR_WINDOW_MS  10000U  /* observe rx_notif for 10 s after the reconnect */
 #define ZR_MIN_RX     100U    /* < this many notifications in the window == zombie (burst only) */
 #define ZR_MAX_BOUNCE 3U      /* recovery bounces per zombie episode before giving up */
@@ -536,21 +536,20 @@ static void subscribe_pending(struct bt_conn *conn)
 				LOG_INF("param re-drive requested: latency 0, timeout 4000 ms");
 			}
 		}
-		/* #8 auto-recover: arm the zombie-check on a deep-sleep wake (gap >= ZR_DEEP_MS)
-		 * or on a recovery bounce's reconnect. A genuine idle (no reconnect) and a light
-		 * bounce (short gap, not recovering) never arm -> no idle/bounce loop. */
+		/* #8 auto-recover: arm the zombie-check on EVERY reconnect (zombie is probabilistic,
+		 * not duration-gated). A non-recovering reconnect = a fresh episode (attempts reset);
+		 * a bounce's reconnect (zr_recovering) keeps the attempt count. Storm-safe via the
+		 * reschedule (only the post-storm check fires). */
 		{
 			uint32_t gap = k_uptime_get_32() - last_disc_ms;
 
-			if (gap >= ZR_DEEP_MS || zr_recovering) {
-				if (gap >= ZR_DEEP_MS && !zr_recovering) {
-					zr_attempts = 0; /* fresh deep-sleep episode */
-				}
-				zr_rx_at_arm = rx_notif;
-				k_work_reschedule(&zombie_check_work, K_MSEC(ZR_WINDOW_MS));
-				LOG_INF("zombie-check armed: gap=%us recovering=%d rx0=%u",
-					gap / 1000U, zr_recovering ? 1 : 0, rx_notif);
+			if (!zr_recovering) {
+				zr_attempts = 0; /* fresh episode (natural reconnect, not a bounce) */
 			}
+			zr_rx_at_arm = rx_notif;
+			k_work_reschedule(&zombie_check_work, K_MSEC(ZR_WINDOW_MS));
+			LOG_INF("zombie-check armed: gap=%us recovering=%d rx0=%u",
+				gap / 1000U, zr_recovering ? 1 : 0, rx_notif);
 		}
 		return;
 	}
