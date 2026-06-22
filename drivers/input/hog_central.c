@@ -142,9 +142,9 @@ static struct k_work report_work;
  * a ZOMBIE reconnect (conn up, subscribed, but no report flow) is visible at INF. */
 static uint32_t rx_notif;
 static uint32_t pub_reports;
-/* #8 Fix-A diag: last negotiated peripheral latency (0xFFFF = not connected).
- * Surfaced in the heartbeat so a zombie reconnect shows whether the latency clamp
- * to 0 took (fixed) or the peer NAK'd back to 44 (clamp insufficient -> sniff next). */
+/* #8 diag: last negotiated peripheral latency (0xFFFF = not connected). v2 REMOVED the
+ * latency-0 clamp, so this now just OBSERVES the peer's real latency (expect ~44) -- a
+ * baseline to compare zombie frequency against the old clamped-to-0 era. */
 static uint16_t cur_latency = 0xFFFF;
 
 /* #8 auto-recover (path #2): the zombie (reconnect succeeds + an initial burst of
@@ -155,11 +155,18 @@ static uint16_t cur_latency = 0xFFFF;
  * zombied while a 78s one didn't, so the old >=90s deep-gate MISSED zombies -- removed).
  * Reconnect storms are safe: each reconnect k_work_reschedule()s the single check, so only
  * the post-storm check fires (no bounce spam). ZR_WINDOW_MS after the reconnect, if rx_notif climbed
- * < ZR_MIN_RX (a zombie only ever shows the ~35 burst), bt_conn_disconnect to force a
+ * < ZR_MIN_RX (a zombie only ever shows the ~88 flush burst), bt_conn_disconnect to force a
  * reconnect, up to ZR_MAX_BOUNCE times, then give up until the next wake. v1 = LIGHT
  * bounce (no sys_reboot) -- also tests whether a dongle-initiated reconnect (not a full
  * reboot) clears the zombie. INF logging only (NO verbose BT DBG, which breaks timing). */
-#define ZR_WINDOW_MS  10000U  /* observe rx_notif for 10 s after the reconnect */
+#define ZR_WINDOW_MS  2000U   /* v2: 2 s (was 10 s) -- the aggressive-but-safe LIMIT for this
+				* count-detector. Data (~/zmk-logs 2026-06-22): healthy reconnects added
+				* 246-598 rx in 10 s; zombies added 0 or 88 (the flush burst, lands <1 s).
+				* Floor: the burst (~88) must fully land AND a healthy link must clear
+				* ZR_MIN_RX -- 2 s leaves ~1 s of post-burst flow, enough for any real motion
+				* (>12 rx). Going faster (instant) needs the v3 live re-subscribe, not a
+				* shorter window. Owner asked for "as fast as possible" (no battery cost: the
+				* window is a dongle-side timer and the dongle is USB-powered). */
 #define ZR_MIN_RX     100U    /* < this many notifications in the window == zombie (burst only) */
 #define ZR_MAX_BOUNCE 3U      /* recovery bounces per zombie episode before giving up */
 static uint32_t last_disc_ms;  /* k_uptime at the last disconnect (deep-sleep gate) */
@@ -517,25 +524,16 @@ static void subscribe_pending(struct bt_conn *conn)
 		/* OBSERVE: log the EFFECTIVE link params even if the peer never sent a
 		 * param-update. interval unit 1.25 ms, timeout unit 10 ms. */
 		if (bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE) {
-			cur_latency = info.le.latency; /* #8 Fix-A diag: surface in heartbeat */
+			cur_latency = info.le.latency; /* #8 diag: surface the peer's latency in heartbeat */
 			LOG_INF("effective params @disc-done: interval %u.%02u ms, latency %u, timeout %u ms",
 				(info.le.interval * 5U) / 4U, ((info.le.interval * 5U) % 4U) * 25U,
 				info.le.latency, info.le.timeout * 10U);
 		}
-		/* #8 Fix-A: actively re-drive the link to latency 0 after discovery, the
-		 * way a macOS host does -- denies the peer the long skip-window that, after
-		 * a DEEP sleep, correlates with the "connected but not streaming" zombie.
-		 * Low risk: -EALREADY if already there; if the peer NAKs nothing changes. */
-		{
-			struct bt_le_conn_param *np = BT_LE_CONN_PARAM(6, 12, 0, 400);
-			int perr = bt_conn_le_param_update(conn, np);
-
-			if (perr && perr != -EALREADY) {
-				LOG_WRN("param re-drive (latency 0) request failed (%d)", perr);
-			} else {
-				LOG_INF("param re-drive requested: latency 0, timeout 4000 ms");
-			}
-		}
+		/* #8 v2: the active latency-0 re-drive (Fix-A) was REMOVED here. lat=0 never
+		 * fixed the zombie (proven: it zombied at lat=0) and forcing latency 0 makes the
+		 * mouse wake on every connection interval (worse battery); auto-recover heals the
+		 * zombie regardless. The peer now keeps its requested latency (~44) -> it can skip
+		 * idle connection events and sleep -> better mouse battery. */
 		/* #8 auto-recover: arm the zombie-check on EVERY reconnect (zombie is probabilistic,
 		 * not duration-gated). A non-recovering reconnect = a fresh episode (attempts reset);
 		 * a bounce's reconnect (zr_recovering) keeps the attempt count. Storm-safe via the
@@ -900,7 +898,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	pending_count = 0;
 	pending_idx = 0;
 	disc_state = DISC_IDLE;
-	cur_latency = 0xFFFF; /* #8 Fix-A diag: latency n/a while disconnected */
+	cur_latency = 0xFFFF; /* #8 diag: latency n/a while disconnected */
 	last_disc_ms = k_uptime_get_32(); /* #8 auto-recover: deep-sleep gate timestamp */
 	/* Invalidate the peer's layout the instant the link drops: reports still
 	 * queued (or arriving before the next peer's report map is parsed) must NOT
@@ -921,23 +919,11 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	start_scan(); /* auto-reconnect: re-scan, match the bonded peer, re-discover */
 }
 
-/* #8 Fix-A: clamp the peer's requested peripheral latency to 0. The IST PRO asks
- * for latency 44 on every (re)connect; after a DEEP sleep that long skip-window
- * correlates with a "connected but not streaming" zombie (reports stop arriving
- * though the link stays up, with no supervision timeout). macOS, which is immune,
- * drives HID links toward latency 0. Accept the peer's interval/timeout but force
- * latency 0 (floor the timeout for safety). Also actively re-driven after discovery
- * in subscribe_pending(). PLAUSIBLE, not proven: if the peer NAKs, the heartbeat
- * 'lat=' field still shows 44 and the zombie persists -> escalate to an OTA sniff. */
-static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
-{
-	ARG_UNUSED(conn);
-	param->latency = 0U;
-	if (param->timeout < 100U) { /* keep >= 1 s supervision (unit 10 ms) */
-		param->timeout = 400U;
-	}
-	return true;
-}
+/* #8 v2: le_param_req (the Fix-A latency-0 clamp) was REMOVED. With no le_param_req
+ * callback registered the host accepts the peer's requested params by default, so the
+ * IST PRO keeps its preferred latency (~44) -> it can skip idle connection events and
+ * sleep -> better mouse battery. lat=0 was proven NOT to fix the zombie; auto-recover
+ * (the bt_conn_disconnect bounce) is what actually heals it. */
 
 /* OBSERVE: log the FINAL negotiated link params. Fires once per (re)negotiation,
  * NOT per-PDU. interval unit = 1.25 ms, timeout unit = 10 ms. */
@@ -945,7 +931,7 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval,
 			     uint16_t latency, uint16_t timeout)
 {
 	ARG_UNUSED(conn);
-	cur_latency = latency; /* #8 Fix-A diag: track effective latency for the heartbeat */
+	cur_latency = latency; /* #8 diag: track effective latency for the heartbeat */
 	LOG_INF("conn params updated: interval %u.%02u ms, latency %u, timeout %u ms",
 		(interval * 5U) / 4U, ((interval * 5U) % 4U) * 25U, latency, timeout * 10U);
 }
@@ -964,7 +950,6 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
 	.security_changed = security_changed,
-	.le_param_req = le_param_req,
 	.le_param_updated = le_param_updated,
 	.le_phy_updated = le_phy_updated,
 };
