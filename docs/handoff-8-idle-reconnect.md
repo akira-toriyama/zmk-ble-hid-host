@@ -304,6 +304,17 @@ sample). Owner returns, moves it → reconnect @18:55:46 (ADV `type=0`, secured 
   dropout per reboot). **To validate #8, keep the Mac AWAKE (`caffeinate`) so the dongle stays running, let the
   MOUSE deep-sleep (≥~10 min), then move it** = the running-dongle deep-sleep reconnect. (Owner triggers
   caffeinate on return; separately, the USB-power-on-sleep behavior is a macOS setting worth fixing for daily use.)
+- 🎯 **FIRST auto-recover firing — SELF-HEALED (2026-06-22 12:25; 1 sample, with nuance).** Finally a
+  running-dongle deep-sleep reconnect (dongle did NOT reboot): 12:25:07 reconnect after gap=306s (~5 min mouse
+  sleep), lat=0 → `zombie-check armed rx0=3932`. Over the next ~28 s: **ZOMBIE detected** (`rx+88<100 in 10s`)
+  → **`auto-recover bounce 1/3`** (`bt_conn_disconnect` → logs reason **0x16**, distinguishable from 0x13 sleep
+  / 0x08 timeout) → after the bounce + 2 interspersed **`0x08` supervision timeouts** (12:25:16, 12:25:24, each
+  self-reconnecting) → `zombie-check OK: rx+273 in 10s (flowing)` @12:25:35, HB `conn=1 sub=5 lat=0 zr=1`, rx
+  climbing. ⇒ **the dongle self-healed the zombie with NO owner re-plug (zr=1, ended healthy).** Detection +
+  recovery both worked. **NUANCES (watch):** (a) this episode mixed in **0x08 supervision timeouts** — unlike
+  the earlier clean *link-held* zombies; possibly the latency-0 clamp (Fix-A) trades link-held-zombie for 0x08
+  thrashing → **consider DROPPING the latency clamp in v2** (it never fixed the zombie anyway). (b) recovery
+  took ~28 s + several reconnect cycles, not one clean bounce. (c) **1 sample only** — accumulate more.
 
 ---
 
