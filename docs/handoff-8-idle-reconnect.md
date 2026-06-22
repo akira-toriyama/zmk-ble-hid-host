@@ -1,6 +1,47 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ⭐ LATEST (2026-06-21 PM) — READ THIS FIRST; the scan theory below is OVERTURNED
+> # ⭐⭐ LATEST (2026-06-22 PM) — auto-recover SHIPPED + WORKING; NEXT SESSION = v2 speed-up. READ THIS FIRST.
+>
+> **The fix WORKS.** The dongle self-heals the post-deep-sleep "connected-but-not-streaming" zombie with NO
+> owner re-plug. On-device confirmed self-heals: 12:25 (rx+88 zombie) and 13:46 (rx+0 HARD zombie) → detect →
+> `bt_conn_disconnect` bounce → reconnect → `zombie-check OK`, `zr` increments. The zombie recurs
+> probabilistically and each time it recovers itself. (Full story: §"FIRST/2nd auto-recover" lower in this doc.)
+>
+> **ON THE DEVICE NOW:** branch `feat/zombie-auto-recover` (code `651d39b`, docs head), **gate-fixed logging
+> uf2 sha `f38c1e1cc1243e7d2da2afb956cf2eb43a2c26bedd0e9604ccb23d623f2f32a4`**. Behaviour: zombie-check arms on
+> EVERY reconnect; if `rx_notif` climbs < `ZR_MIN_RX`(100) in `ZR_WINDOW_MS`(10 s) → `bt_conn_disconnect`
+> bounce, ≤`ZR_MAX_BOUNCE`(3)/episode. Built atop Fix-A (latency-0 clamp + `lat=`/`zr=` HB diag). Mouse usable.
+>
+> ## ⏭️ NEXT SESSION = v2: make recovery FASTER / less frequent (owner's explicit ask "回復の頻度あげれる？").
+> The freeze window per episode = detection (10 s) + reconnect-after-bounce (the mouse re-advertises only on
+> motion → fast if moving, ~52 s if the user pauses). Implement → build → flash → observe:
+> 1. **Shorten detection: `ZR_WINDOW_MS` 10000 → 5000** in `drivers/input/hog_central.c` (keep `ZR_MIN_RX`=100;
+>    the ~88-report flush burst lands in <1 s so a 5 s window still catches burst-zombies, and rx+0 trivially).
+>    → bounces ~5 s sooner.
+> 2. **Drop the latency-0 clamp (Fix-A):** remove `le_param_req` (+ its `conn_callbacks` entry) and the active
+>    `bt_conn_le_param_update(... latency 0 ...)` block in `subscribe_pending`'s discovery-done branch. It never
+>    fixed the zombie (PROVEN: `lat=0` still zombied) and may add 0x08 / raise episode frequency; auto-recover
+>    doesn't depend on it. (Keep the `lat=` HB field or drop it — low value now.) Owner ok'd ①+②; note which helps.
+> 3. **(v3, R&D — biggest win, only if ①②'s freeze is still too long) re-subscribe on the LIVE link instead of
+>    disconnecting:** on zombie detect, re-arm the CCCs (unsubscribe+subscribe / re-write CCC) WITHOUT a
+>    `bt_conn_disconnect`. If notifications resume → near-INSTANT recovery (no reconnect, no motion needed).
+>    UNPROVEN; fall back to the bounce if flow doesn't resume in a short window.
+> - **UX tip to relay to the owner:** after a freeze, KEEP MOVING the mouse (don't 放置) → the bounce's reconnect
+>   fires within ~1-2 s; pausing is what stretched it to ~52 s.
+> - **BUILD:** `/Volumes/workspace/github.com/akira-toriyama/canon/scripts/build-zmk.sh ist --logging` — overlay
+>   the edited `hog_central.c` into `~/.cache/zmk-canon/cfgrepo/zmk-ble-hid-host/drivers/input/`, build, restore
+>   the cache (back up + restore). **FLASH with `cat uf2 > /Volumes/XIAO-SENSE/fw.uf2`, NOT `cp`** (macOS
+>   fcopyfile throws I/O error). `~/bin/flash-ist-logging.sh` already uses `cat`; owner double-taps the dongle reset.
+> - **RE-ARM monitoring:** `bash ~/bin/zmk-monitor-fixa.sh` via the Monitor tool, persistent (alert-only:
+>   surfaces `ZOMBIE`/bounce + hard errors; macOS-pings owner only on real anomalies). The 24/7 serial capture is
+>   the always-on LaunchAgent `com.tommy.zmk-log` → `~/zmk-logs/zmk-YYYY-MM-DD.log` (independent of any session,
+>   so deep-sleep zombies that happen between sessions are still logged — grep `ZOMBIE`/`zombie-check`/`zr=`).
+> - **Record progress** in this doc + GitHub **issue #8** (owner expects issue updates) + commits. NOT
+>   pushed/merged. After v2 proves out (many self-heals, acceptable freeze), build a prod (non-logging) variant + PR to `main`.
+>
+> ---
+>
+> # ⭐ (2026-06-21 PM, SUPERSEDED by the 2026-06-22 section above) — the scan theory below is OVERTURNED
 >
 > Diagnostic firmware (`581d477` = main + `ADV-seen` log, logging build, sha
 > `d1b3c136…`) was **flashed and tested ON-DEVICE today**. The result re-scopes #8
@@ -324,6 +365,17 @@ sample). Owner returns, moves it → reconnect @18:55:46 (ADV `type=0`, secured 
   succeeded** (flasher updated to use cat). CONFIRMED running: post-flash reconnect logged `zombie-check armed:
   gap=22s` (the old 90 s gate would've SKIPPED a 22 s gap) → `zombie-check OK rx+598`. Owner: mouse works →
   into 様子見 (observe). Next: accumulate auto-recover firings on the gate-fixed firmware.
+- 🎯🎯 **2nd + recurring auto-recover SUCCESSES on the gate-fixed fw (2026-06-22 13:46+).** 13:46:41 a HARD
+  zombie `ZOMBIE: rx+0<100` (ZERO reports in 10 s) on a reconnect after a 0x08 → 137 s gap → `auto-recover
+  bounce 1/3` (0x16) → the bounce's reconnect (gap=52 s) → `zombie-check OK: rx+246 (flowing)`, `zr=1`, owner
+  "今は動く" = **self-healed, NO re-plug.** Owner then reports the cycle recurring **何回か (several times)**:
+  "しばらく放置 → 一瞬動く → すぐ固まる → 少し放置 → 普通に動く". ⇒ on the gate-fixed fw the auto-recover
+  RELIABLY ends in recovery, but **every episode has a freeze window and the zombie is happening fairly often.**
+- **Freeze-window breakdown (the v2 target):** ~`ZR_WINDOW_MS` (10 s) detection + reconnect-after-bounce. The
+  reconnect waits for the mouse to re-advertise, which it only does **ON MOTION** → fast (~1-2 s) if the user
+  keeps moving, slow (~52 s observed) if they pause/放置. Plus a handful of single 0x08s today (maybe the
+  latency-0 clamp adds instability). Owner asked to make recovery faster/less frequent → see the v2 plan at the
+  TOP of this doc.
 
 ---
 
