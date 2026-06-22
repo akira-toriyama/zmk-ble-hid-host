@@ -1,6 +1,58 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ⭐⭐ LATEST (2026-06-22 PM) — auto-recover SHIPPED + WORKING; NEXT SESSION = v2 speed-up. READ THIS FIRST.
+> # ⭐⭐⭐ LATEST (2026-06-22 PM #2) — v2 SHIPPED (2 s window + Fix-A clamp removed), ON-DEVICE VALIDATED, NOW OBSERVING. READ THIS FIRST.
+>
+> **v2 is on the device and working.** Owner confirms normal operation OK and is observing over time. Two
+> changes, both in `drivers/input/hog_central.c` (the ONLY source file that differs from main; commit `bbb02ee`
+> on branch `feat/zombie-auto-recover`, NOT pushed/merged):
+> 1. **`ZR_WINDOW_MS` 10000 → 2000** (zombie-detect window). The data-driven LIMIT for this count-detector:
+>    `~/zmk-logs` 2026-06-22 showed healthy reconnects add **246-598 rx in 10 s** while zombies add **0 or 88**
+>    (the flush burst, lands <1 s). `ZR_MIN_RX` stays **100** (can't go below the ~88 burst ceiling → false
+>    negatives). Owner asked "as fast as possible"; **2 s is the floor** — faster needs v3 (live re-subscribe),
+>    not a shorter window. No battery cost (the window is a dongle-side timer; the dongle is USB-powered).
+> 2. **Removed the Fix-A latency-0 clamp** (`le_param_req` + its conn_callbacks entry + the active
+>    `bt_conn_le_param_update` re-drive in `subscribe_pending`). lat=0 was PROVEN not to fix the zombie and it
+>    forced the mouse awake every 7.5 ms (worse battery). With no `le_param_req` the host auto-accepts the peer's
+>    params (Zephyr `conn.c:2078` "Default to accepting", validated by `bt_le_conn_params_valid`) → the IST PRO
+>    keeps **latency 44** → it sleeps between idle events → **better mouse battery.** The create-time
+>    `BT_LE_CONN_PARAM(...,0,...)` at `device_found` is a DIFFERENT mechanism (initiator window, 5 s supervision)
+>    and is intentionally left as-is.
+>
+> **Build:** logging uf2 sha `0eb3902e36be23300cb2268e8649d38d5ea5b8367872a8f51e0bca680f695062` (byte-identical
+> across two builds — comment-only cleanup between them). Built via the overlay method (copy edited hog_central.c
+> into `~/.cache/zmk-canon/cfgrepo/zmk-ble-hid-host/drivers/input/`, `canon/scripts/build-zmk.sh ist --logging`,
+> then `git -C <cache> checkout` to restore — that cache is at an OLD base but hog_central.c is the ONLY differing
+> file, so overlay-one-file is correct & proven). Reviewed by a **3-lens adversarial workflow → all
+> "safe-to-flash", ZERO blockers** (C/build, BLE behavior, false-positive/cross-file).
+>
+> **On-device validation (boot 14:33:31):** `lat=44` ✅ (`conn params updated: ... latency 44`, was lat=0);
+> 2 s window passes healthy (`zombie-check OK: rx+197 in 2s`) ✅ and catches a zombie (`ZOMBIE: rx+0<100 in 2s
+> -> bounce`) ✅; post-boot turbulence (2 bounces + one 0x08) self-healed to a steady link in ~15 s; HB 14:34:27
+> `conn=1 sub=5 rx=738 pub=726 lat=44 zr=2` (healthy, pub tracks rx). Owner: "通常操作OK".
+>
+> ## ⏭️ OBSERVATION PHASE — what to watch in `~/zmk-logs` (24/7 LaunchAgent `com.tommy.zmk-log`; alert monitor live)
+> 1. **False-positive bounce (the v2 tradeoff — BOTH reviewers flagged):** look for `ZOMBIE: rx+NN<100` with NN
+>    in **80-99** IMMEDIATELY followed by a healthy reconnect. That = a HEALTHY link bounced because the user did
+>    "nudge-to-wake → ~88 burst → pause ~2 s". Bounded (`ZR_MAX_BOUNCE`=3) + self-correcting, but if FREQUENT in
+>    daily use → bump `ZR_WINDOW_MS` to **2500-3000** (one-line change + rebuild). 2 s honors the owner's "fastest"
+>    ask; this is the one parameter worth revisiting on-device.
+> 2. **The real #8 test:** after the mouse DEEP-sleeps (離席/放置) and the owner returns + moves it, does it now
+>    recover in ~2 s (+ reconnect) instead of ~10 s+? Trigger is physical, **1 result ≠ conclusive** (owner's
+>    standing method — accumulate several deep-sleep trials).
+> 3. **Unguarded timeout (review W2, low risk):** any `conn params updated: ... timeout <2000 ms`. Only matters if
+>    a 2nd bonded peer requests a short supervision timeout (IST PRO asks 2160 ms → N/A for it).
+> 4. **lat=44 vs lat=0 era:** does removing the clamp change zombie FREQUENCY? (lat=0 still zombied, so expected
+>    no worse — confirm over time.)
+>
+> ## ⏭️ AFTER observation proves out
+> - Build a PROD (non-logging) variant + PR to `main` (owner: only after many self-heals + acceptable freeze).
+> - **v3 (R&D — the real "instant"):** on zombie detect, re-arm the CCCs on the LIVE link (unsubscribe+subscribe /
+>   re-write CCC) WITHOUT `bt_conn_disconnect`. If notifications resume → near-instant, no reconnect, no motion
+>   needed. UNPROVEN; fall back to the bounce. The only lever left once 2 s detection isn't fast enough.
+>
+> ---
+>
+> # ⭐⭐ (2026-06-22 PM, SUPERSEDED by v2 above) — auto-recover SHIPPED + WORKING; NEXT SESSION = v2 speed-up. READ THIS FIRST.
 >
 > **The fix WORKS.** The dongle self-heals the post-deep-sleep "connected-but-not-streaming" zombie with NO
 > owner re-plug. On-device confirmed self-heals: 12:25 (rx+88 zombie) and 13:46 (rx+0 HARD zombie) → detect →
