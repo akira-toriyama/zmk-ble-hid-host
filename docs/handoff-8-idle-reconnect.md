@@ -315,6 +315,15 @@ sample). Owner returns, moves it → reconnect @18:55:46 (ADV `type=0`, secured 
   the earlier clean *link-held* zombies; possibly the latency-0 clamp (Fix-A) trades link-held-zombie for 0x08
   thrashing → **consider DROPPING the latency clamp in v2** (it never fixed the zombie anyway). (b) recovery
   took ~28 s + several reconnect cycles, not one clean bounce. (c) **1 sample only** — accumulate more.
+- 🔧 **Gate bug found + fixed + reflashed (2026-06-22 13:24–13:34).** The 90 s `ZR_DEEP_MS` gate MISSED a 79 s
+  sleep zombie (13:24) → stuck ~4.5 min until the mouse idle-slept + woke healthy (13:31; self-recover via a
+  sleep cycle, no re-plug). Fix `651d39b`: **arm the zombie-check on EVERY reconnect** (the zombie is
+  probabilistic, not duration-gated — a 78 s sleep was healthy, 79 s zombied; storms stay safe via the
+  per-reconnect reschedule). Reflashed (sha `f38c1e1cc1243e7d2da2afb956cf2eb43a2c26bedd0e9604ccb23d623f2f32a4`)
+  — note `cp` failed with macOS `fcopyfile: Input/output error`; **`cat <uf2> > /Volumes/XIAO-SENSE/fw.uf2`
+  succeeded** (flasher updated to use cat). CONFIRMED running: post-flash reconnect logged `zombie-check armed:
+  gap=22s` (the old 90 s gate would've SKIPPED a 22 s gap) → `zombie-check OK rx+598`. Owner: mouse works →
+  into 様子見 (observe). Next: accumulate auto-recover firings on the gate-fixed firmware.
 
 ---
 
