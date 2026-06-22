@@ -101,6 +101,194 @@
 
 ---
 
+## 📍 OBSERVE-mode samples (counter diag `d91b654`) — accumulate here
+
+### Sample 1 — 2026-06-21 ~18:55 (first clean LIVE capture) — POST-RECONNECT FREEZE confirmed
+Owner was away from the desk (離席) → mouse deep-slept (`0x13` @18:41:51, rx=6309 pub=6298) →
+~14 min conn=0. **The 14 min is NOT a reconnect failure** — the owner simply wasn't moving the
+mouse, so it wasn't advertising (rules out the old "motion doesn't re-attach" Failure-B for this
+sample). Owner returns, moves it → reconnect @18:55:46 (ADV `type=0`, secured L2, `conn=1 sub=5`).
+- ~37-report burst at reconnect (6309→6346), then **`rx_notif` FLAT at 6346 for 7+ min**
+  (HB 18:56:07 → 19:03:07, `conn=1 sub=5` throughout) **while the owner was actively moving it**
+  (owner-confirmed live: "今動かした、そして動いていない").
+- `pub` tracked `rx` (flat at 6324) → **NOT (B) work-handler drop, NOT (C) USB.** Reports simply
+  stop ARRIVING at the host after the initial burst.
+- **The LL link stayed UP the whole 7 min — no `0x08` supervision timeout** → the controllers keep
+  exchanging LL PDUs; only the ATT HID notifications stop. = the truth-table "一瞬動いて固まる" mode.
+- The zombie connection then **`0x13`-slept on its own @19:04:21** (rx still 6346 = ZERO reports the
+  entire ~9 min window). Owner did NOT power-cycle the mouse this time (it re-slept first). Owner says
+  mouse OFF/ON would cure it; the other unit on Mac-native BT works fine (owner-confirmed A/B).
+- **Correlation: the zombie followed a LONG/deep sleep (14 min; "離席後に戻ると動かなくなる").** The
+  two SHORT sleeps earlier today (18:34:29→18:35:48, ~1.3 min) reconnected and **worked** (rx climbed
+  into the thousands). → working hypothesis: **deep/long sleep — not the reconnect mechanics per se —
+  is what triggers it.** This matches the owner's lived pattern exactly.
+- ⚠️ **Serial-capture caveat (IMPORTANT for future forensics):** the log was CORRUPTED/lossy
+  18:50–18:56 (a ~5-min flush gap, then a batch where two log lines were concatenated onto one physical
+  line). The zombie reconnect's discovery/subscribe lines were eaten by this → **cannot diff its GATT
+  sequence against a working one.** The working 18:35:48 reconnect logged the full clean sequence incl.
+  `conn params updated: interval 7.50 ms, latency 44, timeout 2160 ms`. So "param update missing on the
+  zombie" is **UNPROVEN** (merely absent from a corrupted log). Note `latency=44` is high — worth
+  checking whether the Mac negotiates a lower peripheral latency (possible differentiator).
+- **Still open: (A) mouse stops emitting HID** vs **(D) dongle controller RX-path wedges after a burst**
+  (link held by TX empty PDUs). Both are cured by ANY forced reconnect, so "mouse OFF/ON cures it" does
+  NOT separate them. **Decisive next test:** the next time it zombies, **re-plug ONLY the dongle (do NOT
+  touch the mouse).** Cursor revives from a dongle reset alone → dongle-side → the handoff's auto-bounce
+  workaround (`bt_conn_disconnect` on "subscribed but rx flat for N s after reconnect") is viable. Only a
+  mouse reset works → mouse-internal.
+
+### Sample 2 — 2026-06-21 19:04→21:52 — idle-death (conn=0) + dongle re-plug → healthy
+- The Sample-1 zombie `0x13`-slept @19:04:21 (rx=6346) → the dongle then stayed **conn=0 for ~2h45m**
+  (19:04 → 21:49), scanning (scan_ok=5, scan_fail=0), rx frozen at 6346. Owner away (evening).
+- **Dongle rebooted @21:49:25** (`*** Booting Zephyr OS ***`, uptime reset, fresh USB
+  "Device connected/reset/configured" @00:00:00) = a **dongle re-plug** (almost certainly the owner).
+  Counters reset to 0/0 — this is why the 22:29 sleep showed rx==pub (gap 0), not the prior gap.
+- After reboot: reconnect @21:52:52 was **HEALTHY** — rx==pub climb in lockstep 0→440→3365→…→18439→
+  …→63292, gap 0 throughout, until a normal `0x13` sleep @22:29:07. A fresh boot gave a clean ~37-min session.
+- ⚠️ **This re-plug did NOT test the (A)/(D) zombie question** — it was done while the mouse was
+  **conn=0 (asleep)**, not during a live zombie (conn=1, rx flat). Keep the two DISTINCT failures separate:
+  **(i) post-reconnect ZOMBIE** (conn=1 sub=5, rx flat, link held — Sample 1; cured by a MOUSE cycle) vs
+  **(ii) idle-death** (conn=0 after long idle, scanner not catching the wake advert — the §12 failure in
+  `investigation-reconnect-freeze.md`; cured by a DONGLE re-plug). PENDING owner confirmation whether
+  19:04→21:49 was *real* idle-death (owner moved it, no reconnect) or merely owner-away/no-advert.
+- 🛠️ **Monitor reliability note:** the persistent `tail -F` monitor MISSED the 21:49 `Booting` line — a
+  re-plug disrupts the USB serial device, the LaunchAgent recreates the log file, and `tail -F` lost the
+  line in the reopen race. FIX applied: also key reboot detection on the first `HB up=60s` (emitted 60 s
+  post-boot once the file is stable → reliably caught). Always corroborate by grepping the log directly.
+
+### Sample 3 — 2026-06-21 22:33 ZOMBIE (clean logs) → 22:37:43 self-RECOVERED via short sleep+wake
+- 22:29:07 normal sleep (rx=63292). 22:33:21 reconnect after a **~4-min** sleep → **ZOMBIE again**, but
+  this time discovery logged CLEANLY (no corruption): report map parsed → all 5 reports subscribed
+  (id 1/2/6/4/9) → discovery done → `conn params updated interval 7.5ms latency 44 timeout 2160ms`.
+  ~30-report burst (63292→63322) then **rx flat at 63322 for ~4 min** while the owner operated the
+  trackball; conn=1 sub=5; no 0x08. → **discovery/subscribe ALL succeed; the bug is purely that
+  notifications stop after the burst** (kills any "silent discovery failure" hypothesis for good).
+- 22:37:33 the zombie mouse `0x13`-slept on its own (idle, owner had paused). 22:37:43 (10 s later) it
+  reconnected and this time **WORKED** (rx resumed climbing 63322→63423→…; owner: "いま動く").
+- ⭐ **The zombie self-cleared via a SHORT sleep+wake cycle** — a mouse power-cycle is NOT the only cure;
+  any shallow reconnect resumes flow.
+- ⭐ **Sleep-duration → outcome, now across 5 reconnects:** 10 s → OK, 1.3 min → OK, **4 min → ZOMBIE**,
+  **14 min → ZOMBIE**. **Deeper/longer sleep triggers the zombie; threshold ~1.3–4 min.** Strongest
+  characterization yet; matches the owner's "離席して戻ると動かなくなる" (long absence) exactly.
+- The dongle-replug experiment did NOT get to run (the mouse self-recovered first). Per owner request the
+  re-plug prompt now lives in the sleep notification ("!ドングル抜き差し!").
+- ▶ Root-cause investigation launched (background Workflow `zmk8-deepsleep-zombie-rootcause`): why does a
+  DEEP-sleep reconnect fully succeed yet HID notifications stop after a burst with the link held — and why
+  is a macOS host immune? Leading hypothesis to test: the high negotiated peripheral **latency=44** + a
+  deep-sleep reconnect leaves the link alive (keepalives) but data PDUs not surfaced; fix candidate =
+  central-side conn-param renegotiation to low latency after connect.
+
+  **RESULT (2026-06-21 PM — workflow `wf_f9d153a8-027`, 13 agents, adversarial). The strong output is
+  ELIMINATIONS (source-proven), which narrow #8 and save dead-end fixes:**
+  - ❌ **RX-buffer / NESN-latch — REFUTED.** The controller RX node is released at HCI-encode time
+    (`zephyr/.../hci/hci_driver.c:535`) BEFORE host delivery (`:737`), so our `notify_cb`/decode can't
+    latch it; the ACK gate (`.../nordic/lll/lll_conn.c:1144-1150`) is real but self-clearing; and the OLD
+    wedge always hit 0x08 within seconds whereas #8 holds 7+ min with NO 0x08 = a different mode. The conf
+    already documents RX 12/10 was MEASURED not to cure it. → **Do NOT bump RX buffers again.**
+  - ❌ **latency=44 as ROOT CAUSE — REFUTED (non-discriminating).** The IST PRO renegotiates latency=44 on
+    EVERY connect incl. the HEALTHY short-sleep ones (`hog_central.c:676-678`); a property identical in
+    pass+fail can't be the cause; latency only licenses skipping when the peer has NO data (a moving ball
+    has data). [It remains the best *lever* — see Fix A.]
+  - ❌ **Service-Changed (0x2A05) not-subscribed — REFUTED.** `zephyr/.../host/att.c:2743-2748` auto-confirms
+    every indication regardless of subscription → an unconfirmed SC can't wedge peer TX. → **Do NOT add 0x2A05.**
+  - ✅ **Surviving picture:** `rx_notif` flat (`hog_central.c:196`) = reports genuinely NOT ARRIVING at our
+    GATT layer (a driver-side drop would fire the silent `report queue full` WRN `hog_central.c:210`). =
+    after a DEEP sleep the peer comes up "connected but not streaming to US", cured only by re-establishing
+    (mouse cycle / shallow reconnect). macOS is immune because it ACTIVELY re-drives conn params post-
+    reconnect; we are observe-only (`hog_central.c:460-467`; no `bt_conn_le_param_update` anywhere). The
+    duration→state threshold is a peer/link timing property **NOT resolvable from this source tree — needs
+    an OTA sniff (Sniffle/btmon) to attribute peer-vs-link definitively.**
+  - ▶ **NEXT (ranked):** (1) **diagnostic** — add live `bt_conn_get_info().le.latency` to the INF heartbeat
+    (NO BT DBG) to SEE the latency during a zombie. (2) **Fix A (plausible, low-risk, NOT proven)** — add
+    `.le_param_req` clamping `latency=0` (`hog_central.c:859`) + active `bt_conn_le_param_update(conn,
+    BT_LE_CONN_PARAM(6,12,0,400))` at discovery-done (replace observe-only `hog_central.c:463-467`),
+    mirroring macOS. If the peer NAKs latency 0 and the zombie persists → escalate to a Sniffle OTA capture.
+    FIXED signature = after a >4-min sleep reconnect, HB `rx_notif` climbs into the thousands while moving +
+    `le_param_updated latency 0`. Validate ≥5 reconnects each at the 4-min AND 14-min cases (probabilistic;
+    one green run ≠ proof). Full report: `tasks/wajq7wtjt.output` / workflow `wf_f9d153a8-027`.
+
+### Fix-A BUILT — 2026-06-21 23:41 (branch `feat/reconnect-param-redrive` `d622bd0`, UNPUSHED)
+- Implements diagnostic + Fix-A in `drivers/input/hog_central.c` (atop the counter diag):
+  1. `le_param_req` clamps the peer's requested **latency to 0** (accept its interval/timeout; floor
+     timeout ≥1 s). 2. After discovery (`subscribe_pending` done-branch) actively
+     `bt_conn_le_param_update(conn, BT_LE_CONN_PARAM(6,12,0,400))` = latency 0, **4000 ms** timeout
+     (mirror macOS; longer timeout also guards the old 0x08 wedge). 3. Heartbeat gains **`lat=`**
+     (`cur_latency`, set in `le_param_updated` + at disc-done, reset 0xFFFF on disconnect).
+- Logging uf2: `canon/firmware/ble_hid_host_receiver-logging.uf2`, **sha256
+  `4df497e863c5de30c8c1d88ed822c9f1cdc334b5df3147d2e9f96730527c3d64`**. Build green (Docker
+  `zmk-build-arm:stable`); Fix-A strings verified present in `zmk.elf` (`lat=%u`, `param re-drive …`).
+- **TEST PLAN (on-device):** flash → reconnect should log `lat=0` (not 44). Then let the mouse DEEP-sleep
+  **>4 min**, return, move continuously 60 s. **FIXED** = HB `rx_notif` climbs into the thousands while
+  moving AND `lat=0`. **Fix-A insufficient** = HB shows `lat=44` (peer NAK'd the clamp) and/or rx flat →
+  next step = OTA sniff (Sniffle). Watch the 0x08 monitor for any regression from the lower latency.
+  Validate ≥5 reconnects each at the 4-min AND 14-min sleep cases (probabilistic; one green run ≠ proof).
+- NOT pushed/merged. Default (non-logging) prod variant NOT built yet — build `ist` (no `--logging`) after
+  Fix-A is proven on-device.
+- ✅ **FLASHED 2026-06-21 23:51** (boot `*** Booting Zephyr OS ***` @23:51:04; `lat=` field live, sentinel
+  `lat=65535` while disconnected = code confirmed). **First post-flash reconnect @23:56:31:** peer requested
+  latency 44 → **`le_param_req` clamped it to latency 0** (`conn params updated … latency 0`), then the active
+  re-drive applied (`param re-drive requested … latency 0 timeout 4000 ms` → `conn params updated … latency 0
+  timeout 4000 ms`); the peer then re-requested timeout 2160 ms (latency stayed 0). **Cursor works at latency
+  0** (owner-confirmed "動く") → latency 0 does NOT break normal operation and the clamp PROVABLY takes (the
+  peer accepts latency 0). Benign churn: a timeout tug-of-war (ours 4000 vs peer 2160) but latency held at 0.
+- ⏳ **NOT yet the fix proof** — 23:56 was a SHALLOW reconnect (always worked pre-fix too). The decider is the
+  **DEEP-sleep (>4 min) reconnect**: FIXED = `lat=0` + `rx_notif` climbs into the thousands while moving (no
+  zombie). Validate ≥5× each at the 4-min AND 14-min sleep cases (probabilistic; one green run ≠ proof).
+- ❌ **Fix-A FAILED on-device (2026-06-22 00:09–00:12) — latency DEFINITIVELY ruled out.** After a ~10-min
+  deep sleep (23:59:40→00:09:31), reconnect logged **`lat=0`** (clamp + active re-drive both worked; the peer
+  ACCEPTED latency 0), conn=1 sub=5, full discovery. HB 00:10:02 = `lat=0 rx_notif=253` (218→**+35 burst**)
+  `pub=243` → then **rx flat; owner: "一瞬動いて固まった"** = the SAME zombie despite latency 0. Mouse
+  idle-slept out of it @00:12:35 (rx still 253). → **latency was never the cause** — this empirically confirms
+  the workflow's adversarial elimination of the latency hypothesis. `feat/reconnect-param-redrive` is a dead
+  end as a FIX (keep only the `lat=` heartbeat diagnostic; the clamp is harmless but pointless).
+- ▶ **Next options (Fix-A dead, latency + RX-pool + SC all ruled out):**
+  (1) **OTA sniffer (Sniffle/nRF) — the clean path.** `rx_notif` flat only proves OUR HOST doesn't receive;
+  only an over-the-air capture distinguishes **(A) mouse goes silent** vs **(D) mouse transmits but the dongle
+  controller drops**. That verdict picks the real fix. REQUIRED for certainty.
+  (2) **Pragmatic auto-recover (heuristic, no sniffer).** On a reconnect, if an initial burst arrives (≥K
+  reports, proving the mouse CAN send) then `rx_notif` stays flat for N s, `bt_conn_disconnect()` once to force
+  a fresh reconnect (which clears the zombie — shallow reconnects always work). False-positives (bouncing a
+  healthy *idle* link) are mostly INVISIBLE because they fire during a no-motion window; gate to ≤1-2 bounces
+  per connection and require the initial burst (so a truly-idle "user away, no burst" link is never bounced).
+  Not a root-cause fix, but likely turns the dead-cursor into a ~1-2 s self-heal. The earlier "auto-bounce is
+  unsafe" caveat is softened by the burst-gate + the fact the bounce lands during idle.
+- Re-plug experiment STILL not run cleanly: the zombie mouse idle-sleeps (0x13) within ~3 min every time,
+  closing the conn=1 window before a re-plug can be staged. (And shallow reconnects already prove a forced
+  reconnect clears it, so the experiment's marginal value has dropped.)
+- ⚠️ **The zombie is PROBABILISTIC, not duration-gated (correction to earlier samples).** Post-Fix-A
+  deep-sleep reconnects, BOTH `lat=0`: **00:09:31** (after ~10-min sleep) = **ZOMBIE** (rx 218→253 = +35
+  burst then flat; owner "一瞬動いて固まった"); **00:32:07** (after ~20-min sleep) = **HEALTHY** (rx 253→543
+  = +290 sustained, owner "動く"). A LONGER sleep worked while a SHORTER one zombied → the earlier
+  "deeper sleep = worse" threshold was an over-read of small data. The zombie fires **stochastically** per
+  reconnect. ⇒ cannot judge "fixed" or "Fix-A helped/hurt" from single samples; must accumulate the zombie
+  **RATE** over many reconnects (ideally compare with vs without Fix-A). Tally so far (post-Fix-A, all lat=0):
+  **1 zombie / 1 healthy** at deep sleeps. This is exactly why the owner's "accumulate, don't conclude from
+  one" rule is load-bearing here.
+- 2026-06-22 morning: owner away ~7 h, Mac deep-slept → **this Mac CUTS dongle USB power on a long sleep**
+  (dongle rebooted `*** Booting ***` @09:05:35 on wake; short naps had kept it powered). First post-boot HB
+  @09:06:32 = `conn=1 sub=5 lat=0 rx_notif=3232 pub=3232` → the **deepest sleep yet (~7 h) reconnected
+  HEALTHY** (3232 reports in 60 s, rx==pub). Kills "deeper = worse" entirely. Running tally (post-Fix-A, all
+  lat=0): **1 zombie / 2 healthy**.
+- 🔬 **Tentative new lead (small n — do NOT conclude):** split by dongle state at reconnect — **fresh-boot**
+  reconnects 23:56 + 09:06 = **healthy (2/2)**; **already-running-dongle** reconnects 00:09 (zombie) + 00:32
+  (healthy) = 1/2. Hypothesis to test as samples grow: the zombie may favor reconnects on a dongle that has
+  been *running a while* (accumulated host/GATT/conn RAM state) vs a clean boot. If it holds, a periodic
+  self-reboot or a state-reset-on-reconnect becomes a candidate fix — but the workflow already eliminated the
+  obvious dongle-internal latches, so treat with suspicion until the OTA sniff or many more samples weigh in.
+- ✅ **RE-PLUG EXPERIMENT RAN CLEANLY (2026-06-22 09:24) — recovery is DONGLE-SIDE (owner + counters confirm).**
+  09:24:01 reconnect after a ~6.5-min sleep, `lat=0` → **ZOMBIE** (owner: "動かない"). Owner **re-plugged the
+  DONGLE ONLY (mouse NOT power-cycled)** @09:24:34 (`*** Booting ***`). Post-reboot HB @09:25:30 =
+  `conn=1 sub=5 lat=0 rx_notif=1874 pub=1874` = **HEALTHY** (owner: "動く"). ⇒ **a dongle reset/reconnect cures
+  the zombie; the mouse needs NO power-cycle.** Confirms the fix can be **100% dongle-side**.
+- ▶ **Auto-recover (path #2) — branch `feat/zombie-auto-recover`.** Detection: on a reconnect following a ≥90 s
+  disconnect (deep-sleep wake) — or a recovery bounce — snapshot `rx_notif`; 10 s later if the delta < 100
+  (zombie = only the ~35 burst) force a fresh reconnect via `bt_conn_disconnect`, up to 3 bounces, then give up
+  until the next wake. Deep-sleep gate + bounce-cap prevent idle/bounce loops; a false positive (user wakes but
+  doesn't move 10 s) costs only invisible reconnects during a no-motion window. v1 = LIGHT bounce (also tests
+  whether a dongle-initiated reconnect, not a full reboot, clears it). If bounces fail on-device → v2 = guarded
+  `sys_reboot`. HB gains `zr=` (total bounces).
+
+---
+
 ## TL;DR (the corrected picture)
 
 - The bug is **dongle-side and fixable** (not the mouse). Proven by a clean A/B:

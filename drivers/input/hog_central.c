@@ -147,6 +147,59 @@ static uint32_t pub_reports;
  * to 0 took (fixed) or the peer NAK'd back to 44 (clamp insufficient -> sniff next). */
 static uint16_t cur_latency = 0xFFFF;
 
+/* #8 auto-recover (path #2): the zombie (reconnect succeeds + an initial burst of
+ * reports arrives, then rx_notif goes flat while the LL link stays up) is cured by a
+ * fresh reconnect -- owner-confirmed 2026-06-22: a DONGLE re-plug revives it with NO
+ * mouse power-cycle. So detect it and force a fresh reconnect ourselves. Detection is
+ * gated to deep-sleep wakes (reconnect after a >=ZR_DEEP_MS gap) and to recovery
+ * bounces, so a genuine idle (no reconnect) and a light bounce (short gap) never
+ * re-arm -> no idle/bounce loop. ZR_WINDOW_MS after the reconnect, if rx_notif climbed
+ * < ZR_MIN_RX (a zombie only ever shows the ~35 burst), bt_conn_disconnect to force a
+ * reconnect, up to ZR_MAX_BOUNCE times, then give up until the next wake. v1 = LIGHT
+ * bounce (no sys_reboot) -- also tests whether a dongle-initiated reconnect (not a full
+ * reboot) clears the zombie. INF logging only (NO verbose BT DBG, which breaks timing). */
+#define ZR_DEEP_MS    90000U  /* reconnect must follow a >=90 s disconnect to be a deep-sleep wake */
+#define ZR_WINDOW_MS  10000U  /* observe rx_notif for 10 s after the reconnect */
+#define ZR_MIN_RX     100U    /* < this many notifications in the window == zombie (burst only) */
+#define ZR_MAX_BOUNCE 3U      /* recovery bounces per zombie episode before giving up */
+static uint32_t last_disc_ms;  /* k_uptime at the last disconnect (deep-sleep gate) */
+static uint32_t zr_rx_at_arm;  /* rx_notif snapshot when the check was armed */
+static uint32_t zr_attempts;   /* bounces used in the current episode (survives the bounce reconnect) */
+static bool zr_recovering;     /* true between a bounce and its reconnect -> re-arm the check */
+static uint32_t zr_bounces;    /* total auto-recover bounces (heartbeat diag) */
+
+static void zombie_check_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	struct bt_conn *c = default_conn; /* snapshot: disconnected() may NULL it on the BT wq */
+	uint32_t delta;
+
+	if (!c) {
+		return; /* link dropped before the check -> nothing to recover */
+	}
+	delta = rx_notif - zr_rx_at_arm;
+	if (delta >= ZR_MIN_RX) {
+		LOG_INF("zombie-check OK: rx+%u in %us (flowing)", delta, ZR_WINDOW_MS / 1000U);
+		zr_recovering = false;
+		zr_attempts = 0;
+		return;
+	}
+	if (zr_attempts < ZR_MAX_BOUNCE) {
+		zr_attempts++;
+		zr_bounces++;
+		zr_recovering = true; /* the bounce's reconnect must re-arm this check */
+		LOG_WRN("ZOMBIE: rx+%u<%u in %us (conn=1 sub=%u) -> auto-recover bounce %u/%u",
+			delta, ZR_MIN_RX, ZR_WINDOW_MS / 1000U, (unsigned)sub_count,
+			zr_attempts, ZR_MAX_BOUNCE);
+		bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+	} else {
+		LOG_WRN("ZOMBIE persists after %u bounces -> giving up until next wake", ZR_MAX_BOUNCE);
+		zr_recovering = false;
+		zr_attempts = 0;
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(zombie_check_work, zombie_check_handler);
+
 static void report_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -483,6 +536,22 @@ static void subscribe_pending(struct bt_conn *conn)
 				LOG_INF("param re-drive requested: latency 0, timeout 4000 ms");
 			}
 		}
+		/* #8 auto-recover: arm the zombie-check on a deep-sleep wake (gap >= ZR_DEEP_MS)
+		 * or on a recovery bounce's reconnect. A genuine idle (no reconnect) and a light
+		 * bounce (short gap, not recovering) never arm -> no idle/bounce loop. */
+		{
+			uint32_t gap = k_uptime_get_32() - last_disc_ms;
+
+			if (gap >= ZR_DEEP_MS || zr_recovering) {
+				if (gap >= ZR_DEEP_MS && !zr_recovering) {
+					zr_attempts = 0; /* fresh deep-sleep episode */
+				}
+				zr_rx_at_arm = rx_notif;
+				k_work_reschedule(&zombie_check_work, K_MSEC(ZR_WINDOW_MS));
+				LOG_INF("zombie-check armed: gap=%us recovering=%d rx0=%u",
+					gap / 1000U, zr_recovering ? 1 : 0, rx_notif);
+			}
+		}
 		return;
 	}
 
@@ -733,10 +802,10 @@ static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat_handler);
 static void heartbeat_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u rx_notif=%u pub=%u lat=%u",
+	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u rx_notif=%u pub=%u lat=%u zr=%u",
 		k_uptime_get_32() / 1000U, default_conn ? 1 : 0,
 		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails,
-		rx_notif, pub_reports, cur_latency);
+		rx_notif, pub_reports, cur_latency, zr_bounces);
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60));
 }
 
@@ -833,6 +902,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	pending_idx = 0;
 	disc_state = DISC_IDLE;
 	cur_latency = 0xFFFF; /* #8 Fix-A diag: latency n/a while disconnected */
+	last_disc_ms = k_uptime_get_32(); /* #8 auto-recover: deep-sleep gate timestamp */
 	/* Invalidate the peer's layout the instant the link drops: reports still
 	 * queued (or arriving before the next peer's report map is parsed) must NOT
 	 * be decoded against a stale layout -- critical when reconnecting to a
