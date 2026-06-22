@@ -286,6 +286,24 @@ sample). Owner returns, moves it → reconnect @18:55:46 (ADV `type=0`, secured 
   doesn't move 10 s) costs only invisible reconnects during a no-motion window. v1 = LIGHT bounce (also tests
   whether a dongle-initiated reconnect, not a full reboot, clears it). If bounces fail on-device → v2 = guarded
   `sys_reboot`. HB gains `zr=` (total bounces).
+- ✅ **BUILT + FLASHED + LIVE 2026-06-22** (branch `feat/zombie-auto-recover` `4545b46`; logging uf2 sha
+  `4223b16d9ba15b790c93be8f30d2544cfa0c42dc325e6022aeff7bf161c3c2b3`; auto-recover strings verified in
+  `zmk.elf`). Flash reboot @10:15:30; post-boot HB @10:16:27 = `conn=1 sub=5 lat=0 rx_notif=3116 pub=3116
+  **zr=0**` → firmware confirmed running (new `zr=` field present) + healthy. `zr=0` = no zombie/bounce yet
+  (expected — needs a deep-sleep wake). **On-device validation pending:** watch for `zombie-check armed` →
+  `ZOMBIE: … auto-recover bounce 1/3` → reconnect → rx resumes + `zr` increments = self-heal WORKS; or
+  `ZOMBIE persists after 3 bounces` = the light bounce is insufficient → v2 = guarded `sys_reboot`. Accumulate
+  many deep-sleep wakes (probabilistic). NOT pushed/merged; prod (non-logging) variant after it's proven.
+- ⚠️ **Mac USB-power oscillation BLOCKS #8 validation (2026-06-22 ~11:11–11:27, owner away).** This Mac CUTS
+  dongle USB power on sleep and was napping aggressively (~7 reboots since 09:05; the last several ~2 min
+  apart: 11:11 / 11:22 / 11:24 / 11:26). EVERY reboot is BENIGN — logging GAP before it + `usb_hid: Device
+  suspended` / `Device reset detected` at boot + NO fault/ZOMBIE + `zr=0` healthy while up → the **FIRMWARE IS
+  INNOCENT** (it never `sys_reboot`s; auto-recover only `bt_conn_disconnect`s). Consequence: each reboot →
+  fresh-boot reconnect (always healthy, 4/4+), so the **running-dongle deep-sleep reconnect — the actual zombie
+  condition — is never reached** → `zr` stays 0 and auto-recover is UNtested. Also makes the mouse janky (~2 s
+  dropout per reboot). **To validate #8, keep the Mac AWAKE (`caffeinate`) so the dongle stays running, let the
+  MOUSE deep-sleep (≥~10 min), then move it** = the running-dongle deep-sleep reconnect. (Owner triggers
+  caffeinate on return; separately, the USB-power-on-sleep behavior is a macOS setting worth fixing for daily use.)
 
 ---
 
