@@ -1,6 +1,37 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ⭐⭐⭐ LATEST (2026-06-22 PM #2) — v2 SHIPPED (2 s window + Fix-A clamp removed), ON-DEVICE VALIDATED, NOW OBSERVING. READ THIS FIRST.
+> # ⭐⭐⭐⭐ LATEST (2026-06-22 PM #3) — the "mouse acts up / freezes" symptom is a KVM-SWITCH REBOOT, not v2. Powered-hub experiment pending (~6/24). READ THIS FIRST.
+>
+> **Root cause of today's "ドングルマウス調子わるい / 動かない":** the owner runs TWO PCs (personal + work) through ONE
+> monitor's built-in USB hub/KVM, with the dongle plugged into the monitor. **Every PC switch cuts the dongle's USB power
+> → the dongle REBOOTS → it lands in the fragile post-boot reconnect window** (the "post-boot zombie": link comes up
+> conn=1 sub=5 but reports don't flow). The log showed **53 reboots today, 44 of them BEFORE v2 was even flashed** → this
+> is NOT a v2/firmware regression; it's the KVM power-cycling the dongle. v2's auto-recover DOES handle it but with churn
+> (sometimes 2-3 bounces + a 0x08; ~seconds up to a few minutes to settle — observed one ~4 min settle at 15:20-15:24).
+> This is a SEPARATE problem from #8 idle-recovery (mouse deep-sleep) — call it the **KVM-switch post-boot zombie**.
+>
+> **Planned fix (owner BOUGHT it, arrives ~2026-06-24):** a SELF-POWERED USB hub between the monitor and the dongle so
+> the dongle keeps VBUS across switches → never reboots → BLE link stays up → mouse works instantly on switch. Product:
+> **Elecom U2H-TZS428SBK** (USB 2.0, 4-port, AC adapter, individual per-port switches). USB **2.0 deliberately** (USB 3.0
+> emits 2.4 GHz noise that degrades BLE; the dongle is a full-speed device so 2.0 costs nothing). The one unknown =
+> whether the hub maintains downstream VBUS when the monitor switches its upstream away (not stated in the spec) → it's
+> an EXPERIMENT (Amazon return kept as a hedge; a negative result is still progress, per the owner).
+>
+> ## ⏭️ VERIFY WHEN THE HUB ARRIVES (~6/24)
+> Connect: hub ← dongle, monitor-USB ← hub, AC plugged, dongle's port switch ON. Switch PCs a few times, then grep
+> `~/zmk-logs/zmk-$(date +%F).log` for `Booting Zephyr`: **NO new "Booting" after a switch = the dongle did NOT reboot =
+> SUCCESS** (mouse should work the instant the switch completes). If it STILL reboots → the hub doesn't hold VBUS on
+> host-loss → try a different powered hub, OR fall back to a firmware "clean post-boot reconnect" fix (hypothesis: the
+> dongle reconnects within the mouse's ~2.16 s supervision timeout, before the mouse drops the stale link → zombie; so
+> delay the first post-boot scan/connect by ~2.5-3 s, or otherwise force a clean re-establishment).
+>
+> **Until 6/24:** the KVM-switch reboot/zombie is KNOWN — ignore it. The alert monitor (`~/bin/zmk-monitor-fixa.sh`) was
+> STOPPED (it was pinging on every switch); the 24/7 `com.tommy.zmk-log` LaunchAgent keeps capturing to disk, so the data
+> is there to grep on 6/24. v2 itself is fine (validated lat=44 + 2 s window healthy when the dongle stays up).
+>
+> ---
+>
+> # ⭐⭐⭐ (2026-06-22 PM #2) — v2 SHIPPED (2 s window + Fix-A clamp removed), ON-DEVICE VALIDATED, NOW OBSERVING.
 >
 > **v2 is on the device and working.** Owner confirms normal operation OK and is observing over time. Two
 > changes, both in `drivers/input/hog_central.c` (the ONLY source file that differs from main; commit `bbb02ee`
