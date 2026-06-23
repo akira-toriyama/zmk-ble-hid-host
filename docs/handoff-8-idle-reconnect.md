@@ -58,6 +58,39 @@
 > **Net: both #8 freeze sources are now addressed** — v3.1 firmware (self-heals idle-recovery zombies) + the hub hardware
 > (prevents the KVM-switch reboot, which was the dominant remaining cause).
 >
+> ### 📋 Observation log (2026-06-23 PM, v3.1 + hub on device, live-monitored)
+>
+> **1. Idle/slow-motion FALSE-POSITIVE freeze — REPRODUCED ON-DEVICE (the user's daily "気になる挙動").** Owner repro:
+> mouse OFF → ON → move slowly → **a momentary freeze → moves a few seconds later**. Live trace (the freeze IS a spurious
+> bounce of a *healthy* link, not a real zombie):
+> ```
+> 18:31:54 disconnected 0x08            ← mouse OFF (supervision timeout)
+> 18:31:56 zombie-check armed gap=2s recovering=0 att=0   ← ON, reconnected
+> 18:31:58 ZOMBIE rx+0<100 in 2s -> bounce 1/2            ← user hadn't moved yet -> detector mistakes idle for a zombie -> BOUNCE = the freeze
+> 18:31:58 disconnected 0x16 (our bounce) / 0x3e (one reconnect miss)
+> 18:32:01 zombie-check OK rx+118 (flowing)               ← user now moving -> recovers = "数秒後に動く"
+> ```
+> Root cause = the known review finding `fp-idle-reconnect-spurious-bounce`: a genuine post-reconnect zombie AND a
+> healthy-but-not-yet-moved reconnect **both** show `rx<ZR_MIN_RX` in the 2 s window; the dongle has no "user is trying to
+> move" signal, so it can't tell them apart and bounces the healthy link. The bounce (disconnect→reconnect) is the freeze.
+> Owner verdict: **"許容できる範囲" (tolerable)** — improvement optional. Proposed fixes (need rebuild+reflash+observe; none
+> applied yet, owner deciding): **A (recommended) debounce** — on the first detection re-arm one more window, bounce only if
+> still silent (the user's motion within ~1-2 s then cancels the false bounce; genuine zombie detection just +~2 s);
+> **B** longer first-window after a reconnect (2 s→3-4 s); **C** burst-then-flat discriminator / motion-aware (v3-live, deeper).
+>
+> **2. First v3.1 self-reboot in the field** — `reboots=1` observed (~18:27:38; budget **1/2**, retained `__noinit` count
+> working). It fired inside a cluster of `0x08` supervision-timeout disconnects; the exact `self-reboot now` trigger line fell
+> in the USB-re-enum capture gap. Budget mechanism behaving (will refill after a sustained healthy session; caps at 2).
+>
+> **3. `0x08` supervision-timeout disconnect cluster** — repeated link drops (~18:23 / 18:27 / 18:29, every ~2-3 min in that
+> window), each → reconnect + a brief zombie/bounce. Underlying link instability (mouse silent > the 2160 ms supervision
+> window). Watch whether it's transient (user activity / 2.4 GHz interference) or persistent; if persistent it inflates both
+> the false-positive bounces and the reboot count, and is the more fundamental thing to chase next.
+>
+> **Live-monitor tooling:** `~/zmk-logs` is tailed via a Monitor (filter: `ZOMBIE|bounce|self-reboot|Booting Zephyr|giving
+> up|zombie-check (OK|armed)|disconnected:`) — events stream live during a repro. NOTE: do NOT include `reboots=[1-9]` in the
+> filter — it matches the per-minute HB line and floods.
+>
 > <details><summary>Deferred review findings (not in v3.1 — known, lower priority)</summary>
 >
 > - `report_work_handler` consumer-side stale-layout race (epoch-tag `report_evt`) — pre-existing, low; exercised more by the bounce flow.
