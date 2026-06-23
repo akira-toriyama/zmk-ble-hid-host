@@ -1,14 +1,17 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ✅ v3 IMPLEMENTED + BUILT + REVIEWED (2026-06-23) — code DONE on `feat/zombie-auto-recover`; next = MANUAL pre-flight → flash → observe. NOT flashed, NOT pushed. READ THIS FIRST.
+> # ✅ v3 SHIPPED TO DEVICE + PUSHED (2026-06-23) — code DONE + FLASHED + on PR #15; next = OBSERVE real zombies. READ THIS FIRST.
 > The escalation ladder (delayed bounce → `sys_reboot`, with loop guards) is implemented, host-tested, Docker-built,
-> and reviewed clean. **Nothing has been flashed and nothing has been pushed/merged — both gated on the owner.**
+> reviewed clean, **flashed to the dongle (logging variant, sha-verified), and pushed to PR #15 (draft) + issue #8**.
+> Remaining = the on-device OBSERVATION phase (does v3 auto-recover a real zombie). Merge to `main` still gated on the
+> owner (build a prod/non-logging variant + un-draft first).
 >
-> **What landed (branch `feat/zombie-auto-recover`, PR #15 draft; 4 commits on top of the plan):**
+> **What landed (branch `feat/zombie-auto-recover`, PR #15 draft — PUSHED, CI host-tests green; commits on top of the plan):**
 > - `22c89f9` pure `zr_decide()` escalation policy + host tests + CI job (Task 1)
 > - `d63d27b` wire `zr_decide` into `zombie_check_handler` + delayed-bounce rung + `healthy_since_boot` flag + delayed re-scan (Task 2)
 > - `b14dca0` self-reboot rung (`sys_reboot(SYS_REBOOT_WARM)`) + boot marker (Task 3)
 > - `ee602d3` polish from final review (defensive reboot-log value; document the deliberate sysworkq stall before reboot)
+> - `70a29e6` handoff/Task-4 verify protocol + gitignore the policy test binary
 >
 > **Verification done (all green):** host policy tests **7/7** (`make -C tests/policy test`, `-Werror` clean, Zephyr-free);
 > Docker **logging** build green → `canon/firmware/ble_hid_host_receiver-logging.uf2`
@@ -22,11 +25,21 @@
 > down-gap / peer reset does (a natural `0x13` mouse sleep self-healed it after the 3 bounces gave up). → ladder =
 > delayed bounce (re-scan after `ZR_BOUNCE_DELAY_MS`=5 s) → `sys_reboot` (= the known re-plug cure), loop-guarded.
 >
-> ## ⏭️ NEXT — Task 4 on-device verification (owner-in-the-loop; 1 result ≠ conclusive — accumulate trials)
-> > **🔴 STEP 1 FIRST, BEFORE flashing v3 — the pre-flight裏取り the owner asked for:** the next time the CURRENT
-> > firmware zombies (gives up), **re-plug ONLY the dongle — do NOT touch the mouse.** If the cursor revives → the
-> > wedge is dongle-side → the `sys_reboot` rung (rung 2) will cure it automatically. Record the result. (This is the
-> > cheap confirmation that rung 2 is the right mechanism before we trust it.)
+> ## ✅ FLASHED 2026-06-23 — what happened + what's confirmed
+> > v3 (logging, sha `48035c61…`) was flashed to the dongle. After a dongle re-plug + mouse OFF/ON it reconnected and
+> > streams healthy (`conn=1 sub=5 lat=44`, `zombie-check OK … flowing`). **Proof it's v3 = the flashed uf2's sha256
+> > matches the v3 build (`ee602d3`) bit-for-bit** — the bootloader writes exactly that image. The pre-flight
+> > "dongle-only re-plug 裏取り" was NOT done (the current firmware never naturally zombied before we flashed) — moot
+> > now: v3 itself self-reports whether the reboot rung cures it (the boot-marker → `zombie-check OK` triple).
+> >
+> > **⚠️ Capture-gap learning:** the boot marker `ble_hid_host up (v3 escalation…)` does NOT appear in `~/zmk-logs` —
+> > the logging capture drops the post-`Booting Zephyr`/pre-HB window on every USB re-enumeration (it drops even the
+> > v2-era `central up on` line). So you CANNOT confirm v3 via the marker in the durable log; the sha-verified flash is
+> > the proof. To see the marker live: stop `com.tommy.zmk-log`, `cat` the dongle CDC port continuously, then
+> > single-tap reset (reboot into firmware) and watch. (Two flashes today: 1st `cat`→`Input/output error` = NORMAL UF2
+> > reboot-on-write, still booted healthy; 2nd `cat` returned clean.)
+>
+> ## ⏭️ NEXT — observation (owner-in-the-loop; 1 result ≠ conclusive — accumulate trials)
 >
 > <details><summary>Full flash + observe protocol (steps 2–5) + what the logs now look like</summary>
 >
