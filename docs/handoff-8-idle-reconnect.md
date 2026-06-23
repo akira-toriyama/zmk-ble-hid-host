@@ -1,6 +1,65 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ⭐⭐⭐⭐ LATEST (2026-06-22 PM #3) — the "mouse acts up / freezes" symptom is a KVM-SWITCH REBOOT, not v2. Powered-hub experiment pending (~6/24). READ THIS FIRST.
+> # ✅ v3 IMPLEMENTED + BUILT + REVIEWED (2026-06-23) — code DONE on `feat/zombie-auto-recover`; next = MANUAL pre-flight → flash → observe. NOT flashed, NOT pushed. READ THIS FIRST.
+> The escalation ladder (delayed bounce → `sys_reboot`, with loop guards) is implemented, host-tested, Docker-built,
+> and reviewed clean. **Nothing has been flashed and nothing has been pushed/merged — both gated on the owner.**
+>
+> **What landed (branch `feat/zombie-auto-recover`, PR #15 draft; 4 commits on top of the plan):**
+> - `22c89f9` pure `zr_decide()` escalation policy + host tests + CI job (Task 1)
+> - `d63d27b` wire `zr_decide` into `zombie_check_handler` + delayed-bounce rung + `healthy_since_boot` flag + delayed re-scan (Task 2)
+> - `b14dca0` self-reboot rung (`sys_reboot(SYS_REBOOT_WARM)`) + boot marker (Task 3)
+> - `ee602d3` polish from final review (defensive reboot-log value; document the deliberate sysworkq stall before reboot)
+>
+> **Verification done (all green):** host policy tests **7/7** (`make -C tests/policy test`, `-Werror` clean, Zephyr-free);
+> Docker **logging** build green → `canon/firmware/ble_hid_host_receiver-logging.uf2`
+> **sha256 `48035c610522aee275120015a43aaea7991d5ebbf984df097ed7c9b0968ffff9`**; per-task reviews + a final whole-feature
+> opus review → **zero Critical/Important**. The two load-bearing facts the reviews confirmed: (1) the bounce attempt
+> count **survives the bounce** (via `zr_recovering`) so the ladder actually reaches the reboot rung after `ZR_BOUNCE_MAX`(2);
+> (2) **no reboot loop** — `healthy_since_boot` re-zeros on warm boot, so a post-boot zombie that never streamed returns
+> `GIVE_UP`, never `REBOOT` (60 s uptime gate is a 2nd backstop).
+>
+> **Root cause (data-confirmed 2026-06-22 log):** a fast bounce (gap=0s) does NOT clear the zombie; only a long
+> down-gap / peer reset does (a natural `0x13` mouse sleep self-healed it after the 3 bounces gave up). → ladder =
+> delayed bounce (re-scan after `ZR_BOUNCE_DELAY_MS`=5 s) → `sys_reboot` (= the known re-plug cure), loop-guarded.
+>
+> ## ⏭️ NEXT — Task 4 on-device verification (owner-in-the-loop; 1 result ≠ conclusive — accumulate trials)
+> > **🔴 STEP 1 FIRST, BEFORE flashing v3 — the pre-flight裏取り the owner asked for:** the next time the CURRENT
+> > firmware zombies (gives up), **re-plug ONLY the dongle — do NOT touch the mouse.** If the cursor revives → the
+> > wedge is dongle-side → the `sys_reboot` rung (rung 2) will cure it automatically. Record the result. (This is the
+> > cheap confirmation that rung 2 is the right mechanism before we trust it.)
+>
+> <details><summary>Full flash + observe protocol (steps 2–5) + what the logs now look like</summary>
+>
+> - **Step 2 — flash the logging variant:** `bash ~/bin/flash-ist-logging.sh` (owner double-taps the dongle reset; it
+>   copies the uf2). Confirm the printed **sha256 = `48035c61…`** and, in the log, the boot marker
+>   `ble_hid_host up (v3 escalation: bounce_max=2 delay=5000ms reboot_gate=60s)`. **Do NOT flash from a session — the
+>   owner flashes** (physical double-tap; macOS bootloader write needs `dangerouslyDisableSandbox` and is owner-driven).
+> - **Step 3 — re-arm the alert monitor:** `bash ~/bin/zmk-monitor-fixa.sh`. ⚠️ **Its grep shape changed** — watch for
+>   `delayed bounce` and `self-reboot now` (was `auto-recover bounce`); and the post-bounce `gap=` now reads **~5 s+**
+>   (the delay), not `0 s`. 24/7 `com.tommy.zmk-log` keeps the durable log either way.
+> - **Step 4 — observe + decide:** for each real zombie (mid-session + post-deep-sleep), in `~/zmk-logs`:
+>   1. Did **rung 1 (delayed bounce)** alone cure it? Look for `ZOMBIE: rx+N<100 … -> delayed bounce X/2 (re-scan in 5000ms)`
+>      then a `zombie-check OK: rx+… (flowing)`. The re-arm after a bounce should log `recovering=1` with a **preserved**
+>      attempt count (1→2) — that's the ladder progressing.
+>   2. If rung 1 was exhausted, did **rung 2 (self-reboot)** cure it? The signal is the triple:
+>      `ZOMBIE persists after 2 bounces (… healthy_since_boot=1) -> self-reboot now` → `*** Booting Zephyr OS ***` →
+>      `ble_hid_host up (v3 escalation…)` → `zombie-check OK`.
+>   3. Confirm **NO reboot loop** (the `healthy_since_boot` + 60 s uptime guards). If a post-boot zombie ever loops, the
+>      guards failed — capture it.
+>   4. Tune `ZR_BOUNCE_DELAY_MS` (one-line + rebuild) if rung 1 needs a longer gap to land.
+>   - Keep the **KVM-switch reboot** case separate — that's the powered-hub's job (~6/24, banner below); don't conflate.
+> - **Step 5 — graduate:** once it self-recovers reliably with no manual action and no loop → build a **prod (non-logging)**
+>   variant, **un-draft PR #15**, PR to `main`. (Push/merge only on explicit owner approval.)
+>
+> **Rebuild recipe (if a param needs tuning):** edit `drivers/input/hog_central.c`, then overlay+build:
+> `cp drivers/input/{hog_central.c,zr_policy.c,CMakeLists.txt} ~/.cache/zmk-canon/cfgrepo/zmk-ble-hid-host/drivers/input/ && cp include/zmk_ble_hid_host/zr_policy.h ~/.cache/zmk-canon/cfgrepo/zmk-ble-hid-host/include/zmk_ble_hid_host/ && /Volumes/workspace/github.com/akira-toriyama/canon/scripts/build-zmk.sh ist --logging && git -C ~/.cache/zmk-canon/cfgrepo/zmk-ble-hid-host checkout -- . && git -C ~/.cache/zmk-canon/cfgrepo/zmk-ble-hid-host clean -fdq`
+> </details>
+>
+> Design spec: `docs/superpowers/specs/2026-06-23-zombie-recovery-v3-design.md` · Plan: `docs/superpowers/plans/2026-06-23-zombie-recovery-v3.md`
+>
+> ---
+>
+> # ⭐⭐⭐⭐ (2026-06-22 PM #3) — the "mouse acts up / freezes" symptom is a KVM-SWITCH REBOOT, not v2. Powered-hub experiment pending (~6/24).
 >
 > **Root cause of today's "ドングルマウス調子わるい / 動かない":** the owner runs TWO PCs (personal + work) through ONE
 > monitor's built-in USB hub/KVM, with the dongle plugged into the monitor. **Every PC switch cuts the dongle's USB power
