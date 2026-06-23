@@ -285,6 +285,47 @@ static void zombie_check_handler(struct k_work *work)
 }
 static K_WORK_DELAYABLE_DEFINE(zombie_check_work, zombie_check_handler);
 
+/* #8 v3.5 latency-R&D instrumentation (LOGGING-ONLY — no behaviour change; zr_decide()
+ * and the recovery ladder are untouched). The post-reconnect silence is BINARY (a
+ * healthy reconnect streams rx ~103-267 within ZR_WINDOW_MS; a silent one stays at
+ * literally 0 — no middle ramp) and is cured only by the bounce. The full-window check
+ * at ZR_WINDOW_MS already decides correctly; the open question is *how early* a healthy
+ * reconnect crosses ZR_MIN_RX, because if it crosses well before ZR_WINDOW_MS then a
+ * SHORTER detection window could fire the curative bounce sooner = shorter freeze. To
+ * learn that crossing curve from the field (~/zmk-logs) we log the rx delta at sub-window
+ * checkpoints WITHOUT touching the decision (still taken at ZR_WINDOW_MS by
+ * zombie_check_work). A few cheap INF lines per episode on the system workqueue (NOT the
+ * GATT notify path) -> no BLE-timing impact. Armed/cancelled in lockstep with
+ * zombie_check_work. Once the curve is known, decide whether a 1 s window + proportional
+ * threshold cleanly separates healthy from silent; until then ZR_WINDOW_MS / ZR_MIN_RX
+ * stay exactly as v3.3. */
+static const uint16_t zr_probe_ms[] = { 500U, 1000U, 1500U }; /* strictly < ZR_WINDOW_MS, ascending */
+static uint8_t zr_probe_idx; /* next checkpoint index to log; reset to 0 when armed */
+
+static void zr_probe_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(zr_probe_work, zr_probe_handler);
+static void zr_probe_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (!default_conn) {
+		return; /* link dropped -> disconnected() cancels this work; episode is over */
+	}
+	uint8_t i = zr_probe_idx;
+	if (i >= ARRAY_SIZE(zr_probe_ms)) {
+		return; /* all checkpoints logged; zombie_check_work decides at ZR_WINDOW_MS */
+	}
+	/* rx_notif is monotonic and zr_rx_at_arm was snapshotted by this same arm, so the
+	 * delta is exactly this window's accumulation regardless of a racing increment. */
+	uint32_t delta = rx_notif - zr_rx_at_arm;
+	LOG_INF("zombie-probe @%ums: rx+%u (thr=%u @ %ums)",
+		(unsigned)zr_probe_ms[i], delta, ZR_MIN_RX, ZR_WINDOW_MS);
+	zr_probe_idx = i + 1;
+	if (zr_probe_idx < ARRAY_SIZE(zr_probe_ms)) {
+		k_work_reschedule(&zr_probe_work,
+				  K_MSEC(zr_probe_ms[zr_probe_idx] - zr_probe_ms[i]));
+	}
+}
+
 static void report_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -630,6 +671,10 @@ static void subscribe_pending(struct bt_conn *conn)
 			}
 			zr_rx_at_arm = rx_notif;
 			k_work_reschedule(&zombie_check_work, K_MSEC(ZR_WINDOW_MS));
+			/* #8 v3.5: log sub-window rx at zr_probe_ms[] (LOGGING-ONLY; the decision
+			 * still happens at ZR_WINDOW_MS above). Same arm snapshot (zr_rx_at_arm). */
+			zr_probe_idx = 0;
+			k_work_reschedule(&zr_probe_work, K_MSEC(zr_probe_ms[0]));
 			LOG_INF("zombie-check armed: gap=%us recovering=%d att=%u rx0=%u",
 				gap / 1000U, zr_recovering ? 1 : 0, zr_attempts, rx_notif);
 		}
@@ -1009,6 +1054,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	 * Cancel it so it cannot fire against the NEXT connection mid-discovery and bounce a
 	 * healthy reconnect (observed in ~/zmk-logs). The new link re-arms at discovery-done. */
 	k_work_cancel_delayable(&zombie_check_work);
+	k_work_cancel_delayable(&zr_probe_work); /* #8 v3.5: its checkpoints belong to this link too */
 
 	/* Read-and-clear: a stranded flag (our bounce racing a natural disconnect) must not
 	 * wrongly delay a later innocent re-scan. */
@@ -1126,8 +1172,8 @@ static void start_work_handler(struct k_work *work)
 		zr_persist_magic = ZR_PERSIST_MAGIC;
 		zr_reboot_count = 0;
 	}
-	LOG_INF("ble_hid_host up (v3.4.2 resub-removed=v3.3 bounce: 1st-bounce-immediate, bounce_max=%u delay=%ums "
-		"reboot_gate=%us budget=%u/%u)",
+	LOG_INF("ble_hid_host up (v3.5 probe=v3.3 bounce + sub-2s rx checkpoints: 1st-bounce-immediate, "
+		"bounce_max=%u delay=%ums reboot_gate=%us budget=%u/%u)",
 		ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U,
 		zr_reboot_count, ZR_REBOOT_BUDGET);
 	start_scan();

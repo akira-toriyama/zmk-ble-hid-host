@@ -1,6 +1,39 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ❌→✅ v3.4 LIVE CCC RE-SUBSCRIBE TRIED ON-DEVICE → FAILED → REVERTED to v3.3 (2026-06-23 night). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> # 🧪 v3.5 SUB-2s rx PROBE — instrumentation BUILT (logging-only, NOT yet flashed) (2026-06-24). branch `feat/zombie-auto-recover`. READ THIS FIRST (supersedes the v3.4 banner below as the current state).
+> **The disciplined next step after v3.4's negative result: LEARN the curve before shortening the window.** v3.4 proved the
+> post-reconnect silence cannot be cured below the bounce cost (no GATT trick restarts notifications). The only remaining latency
+> win is firing the curative bounce SOONER — but this handoff explicitly forbids blindly dropping the 2 s window (2 s-granularity
+> logs can't prove a 1 s window's false-positive rate). v3.5 is the prerequisite: **pure logging** that records the rx delta at
+> sub-window checkpoints {500, 1000, 1500} ms so `~/zmk-logs` reveals exactly how early a HEALTHY reconnect crosses ZR_MIN_RX (=100).
+>
+> **What it does (LOGGING-ONLY — zero behaviour change):** a new self-rescheduling delayable `zr_probe_work`, armed/cancelled in
+> lockstep with `zombie_check_work`, emits `zombie-probe @{500,1000,1500}ms: rx+NN` per episode. The DECISION is unchanged (still
+> taken at ZR_WINDOW_MS=2000 by `zombie_check_work` → pure `zr_decide()`). `zr_policy.c` untouched (host policy tests green). It
+> mutates no recovery state (only the new `zr_probe_idx`); the probe handler makes no `bt_conn` call (only a NULL-check on
+> `default_conn`) → no ref/UAF. Diff = `drivers/input/hog_central.c` only (+48/−2). Built ON the v3.4.2 revert base, so flashing
+> v3.5 ALSO drops the lingering v3.4.1 ~2 s penalty (the device currently still runs v3.4.1) and puts it back on the v3.3
+> immediate-bounce ladder.
+>
+> **Logging build, uf2 sha256 `ddeffc019d80c9b32b6da6b0e52f881001911032a1445304d7c177617b2fe78f`. NOT yet flashed.** Boot marker:
+> `ble_hid_host up (v3.5 probe=v3.3 bounce + sub-2s rx checkpoints …)`. Verified embedded in the ELF; old `v3.4.2 resub-removed`
+> marker gone. **Adversarial review:** 4-lens panel (concurrency/UAF · BLE-timing · no-behaviour-change · arithmetic-edge) + a
+> synthesizer all returned **safe-to-flash, no-behaviour-change, zero critical/important** (the synth cross-checked the built
+> `.config`: system-wq prio −1 < BT-RX −8, single-core cooperative, `LOG_MODE_DEFERRED` → `LOG_INF` copies-and-returns off the
+> GATT path). The 5th lens (work-lifecycle) stalled on infra; its invariant was verified by hand instead — `zombie_check_work` has
+> exactly two lifecycle ops (arm @ the subscribe site, cancel @ `disconnected()`), each paired 1:1 with a `zr_probe_work` op, and
+> the self-reschedule terminates via two `ARRAY_SIZE` guards (idx 0→3 then stops).
+>
+> **Next session step 1 = flash v3.5** (`bash ~/bin/flash-ist-logging.sh`, owner double-taps). Then SOAK over days: collect many
+> real deep-sleep (`0x13`) / idle wakes and read the `zombie-probe @…ms: rx+NN` lines. ANALYSIS GOAL = does a healthy reconnect
+> cross ~100 well before 2000 ms, AND do silent episodes stay at rx+0 at 500/1000/1500 ms too? If healthy crosses ~100 by e.g.
+> 1000 ms with a clean margin over silent-highs, THEN (and only then) adopt a shorter window + proportional threshold (v3.6) to
+> cut the ~4–7 s freeze. If the bands overlap at sub-2 s, the 2 s window stays — and we've learned the floor is real. Until the
+> analysis is convincing, ZR_WINDOW_MS / ZR_MIN_RX stay exactly as v3.3.
+>
+> _The v3.4 banner below is the experiment record (CCC-drift refuted); v3.5 adds only the measurement it pointed to._
+
+> # ❌→✅ v3.4 LIVE CCC RE-SUBSCRIBE TRIED ON-DEVICE → FAILED → REVERTED to v3.3 (2026-06-23 night). branch `feat/zombie-auto-recover`.
 > **Negative result (conclusive). The cure for the post-reconnect silence REQUIRES the link-layer disconnect (the bounce);
 > no GATT-layer CCC operation re-starts this IST PRO's notifications.** v3.4 tried to cure the silence (link up + subscribed but
 > 0 notifications for ~4 s) WITHOUT the bounce, by re-writing the peer's CCC (notify-enable) over-air on the live link. On-device:
