@@ -44,6 +44,8 @@ LOG_MODULE_DECLARE(ble_hid_host, CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL);
 #include <zephyr/bluetooth/hci.h>
 
 #include <zmk_ble_hid_host/hid_report_parser.h>
+#include <zmk_ble_hid_host/zr_policy.h>
+#include <zephyr/sys/reboot.h>
 
 #define MAX_REPORTS 12
 #define APPEARANCE_MOUSE 0x03C2
@@ -168,12 +170,16 @@ static uint16_t cur_latency = 0xFFFF;
 				* shorter window. Owner asked for "as fast as possible" (no battery cost: the
 				* window is a dongle-side timer and the dongle is USB-powered). */
 #define ZR_MIN_RX     100U    /* < this many notifications in the window == zombie (burst only) */
-#define ZR_MAX_BOUNCE 3U      /* recovery bounces per zombie episode before giving up */
+#define ZR_BOUNCE_MAX            2U      /* delayed bounces before escalating to reboot */
+#define ZR_BOUNCE_DELAY_MS       5000U   /* wait after a zombie disconnect before re-scan (peer reset) */
+#define ZR_REBOOT_MIN_UPTIME_MS  60000U  /* don't self-reboot within this uptime (post-boot loop guard) */
 static uint32_t last_disc_ms;  /* k_uptime at the last disconnect (deep-sleep gate) */
 static uint32_t zr_rx_at_arm;  /* rx_notif snapshot when the check was armed */
 static uint32_t zr_attempts;   /* bounces used in the current episode (survives the bounce reconnect) */
 static bool zr_recovering;     /* true between a bounce and its reconnect -> re-arm the check */
 static uint32_t zr_bounces;    /* total auto-recover bounces (heartbeat diag) */
+static bool zr_healthy_since_boot; /* link streamed healthily at least once this boot (reboot guard) */
+static bool zr_delay_rescan;       /* set before a zombie disconnect -> disconnected() delays re-scan */
 
 static void zombie_check_handler(struct k_work *work)
 {
@@ -185,24 +191,49 @@ static void zombie_check_handler(struct k_work *work)
 		return; /* link dropped before the check -> nothing to recover */
 	}
 	delta = rx_notif - zr_rx_at_arm;
-	if (delta >= ZR_MIN_RX) {
+
+	struct zr_ctx ctx = {
+		.rx_delta = delta,
+		.rx_min = ZR_MIN_RX,
+		.bounce_attempts = zr_attempts,
+		.bounce_max = ZR_BOUNCE_MAX,
+		.uptime_ms = k_uptime_get_32(),
+		.reboot_min_uptime_ms = ZR_REBOOT_MIN_UPTIME_MS,
+		.healthy_since_boot = zr_healthy_since_boot,
+	};
+
+	switch (zr_decide(&ctx)) {
+	case ZR_OK_RESET:
+		zr_healthy_since_boot = true;
+		zr_recovering = false;
+		zr_attempts = 0;
 		LOG_INF("zombie-check OK: rx+%u in %us (flowing)", delta, ZR_WINDOW_MS / 1000U);
+		return;
+	case ZR_DELAYED_BOUNCE:
+		zr_attempts++;
+		zr_bounces++;
+		zr_recovering = true;
+		zr_delay_rescan = true; /* disconnected() will re-scan after ZR_BOUNCE_DELAY_MS */
+		LOG_WRN("ZOMBIE: rx+%u<%u in %us (conn=1 sub=%u) -> delayed bounce %u/%u (re-scan in %ums)",
+			delta, ZR_MIN_RX, ZR_WINDOW_MS / 1000U, (unsigned)sub_count,
+			zr_attempts, ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS);
+		bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		return;
+	case ZR_REBOOT:
+		LOG_WRN("ZOMBIE persists after %u bounces (up=%us, healthy_since_boot=1) -> self-reboot",
+			zr_attempts, k_uptime_get_32() / 1000U);
+		/* implemented in Task 3 */
 		zr_recovering = false;
 		zr_attempts = 0;
 		return;
-	}
-	if (zr_attempts < ZR_MAX_BOUNCE) {
-		zr_attempts++;
-		zr_bounces++;
-		zr_recovering = true; /* the bounce's reconnect must re-arm this check */
-		LOG_WRN("ZOMBIE: rx+%u<%u in %us (conn=1 sub=%u) -> auto-recover bounce %u/%u",
-			delta, ZR_MIN_RX, ZR_WINDOW_MS / 1000U, (unsigned)sub_count,
-			zr_attempts, ZR_MAX_BOUNCE);
-		bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-	} else {
-		LOG_WRN("ZOMBIE persists after %u bounces -> giving up until next wake", ZR_MAX_BOUNCE);
+	case ZR_GIVE_UP:
+	default:
+		LOG_WRN("ZOMBIE persists after %u bounces -> giving up until next wake "
+			"(healthy_since_boot=%d up=%us)",
+			zr_attempts, zr_healthy_since_boot ? 1 : 0, k_uptime_get_32() / 1000U);
 		zr_recovering = false;
 		zr_attempts = 0;
+		return;
 	}
 }
 static K_WORK_DELAYABLE_DEFINE(zombie_check_work, zombie_check_handler);
@@ -794,6 +825,15 @@ static void scan_retry_handler(struct k_work *work)
 }
 static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_handler);
 
+static void zr_rescan_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (!default_conn) {
+		start_scan();
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(zr_rescan_work, zr_rescan_handler);
+
 static void heartbeat_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat_handler);
 static void heartbeat_handler(struct k_work *work)
@@ -916,7 +956,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		ble_hid_host_reset(host_dev);
 	}
 
-	start_scan(); /* auto-reconnect: re-scan, match the bonded peer, re-discover */
+	/* #8 v3: a zombie-recovery bounce delays the re-scan so the peer fully resets;
+	 * all other disconnects re-scan immediately. */
+	if (zr_delay_rescan) {
+		zr_delay_rescan = false;
+		k_work_reschedule(&zr_rescan_work, K_MSEC(ZR_BOUNCE_DELAY_MS));
+	} else {
+		start_scan();
+	}
 }
 
 /* #8 v2: le_param_req (the Fix-A latency-0 clamp) was REMOVED. With no le_param_req
