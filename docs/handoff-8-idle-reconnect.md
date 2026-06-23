@@ -1,6 +1,41 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ⛔→✅ v3.3 RE-ARM REVERTED + real root cause FOUND (2026-06-23 night). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> # 🧪 v3.4 LIVE CCC RE-SUBSCRIBE — BUILT, awaiting flash + SOAK (2026-06-23 night). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> **The real latency win, as a guarded experiment.** v3.3 (below) confirmed the freeze is a post-reconnect SILENCE cured only by
+> the bounce. v3.4 tries to cure it WITHOUT the bounce's disconnect+reconnect cost (most of the 4–7 s freeze): on zombie-detect,
+> **re-write each report's CCC (notify-enable, `0x0001`) over-air on the LIVE link** (`bt_gatt_write`), then re-arm a verify window —
+> if rx advances → **CURED, no disconnect**; if still silent → the proven bounce takes over.
+>
+> **Why it can succeed where `9cbc3ec` regressed:** that used `bt_gatt_resubscribe` = a HOST-LOCAL relink that emits **no ATT**, so it
+> never re-enabled a peer whose CCC drifted after deep sleep (→ silent zombie, replug-only). A **direct CCC write is the real
+> OVER-AIR re-arm**, fired only AFTER the detector confirms silence (not blind-on-reconnect), and guarded so a failure degrades to
+> today's bounce. (Full post-mortem of `9cbc3ec` and the Zephyr API rationale: it had to be a direct CCC write, NOT a re-subscribe —
+> `bt_gatt_subscribe` re-call returns `-EALREADY` and writes nothing.)
+>
+> **Design (policy pure / mechanism thin):** a one-shot `ZR_RESUBSCRIBE` rung in `zr_decide()` before the bounce (`resub_max=1`;
+> `resub_max=0` == prior behaviour, host-tested). Mechanism: dedicated static `bt_gatt_write_params`+buffer (**never** aliases
+> `subs[].params`), CCC writes **chained one-at-a-time** (each from the prior response) to avoid the historic `-ENOMEM` TX-pool storm;
+> `-ENOMEM/-ENOTCONN` stop the chain (no retry-storm) and fall through to the bounce; `bt_conn_ref` across the handler; gated on
+> `disc_state==DISC_IDLE`; `BUILD_ASSERT(ZR_RESUB_MAX==1)` pins the one-in-flight invariant; HB gains `resub=`, boot marker → v3.4.
+>
+> **Fail-safe = worst-case == prior behaviour:** a failed/ignored kick issues no disconnect and mutates nothing the bounce relies on,
+> so the detector still fires and the bounce (which rebuilds `subs[]` from scratch) is the floor. Verified by a multi-lens adversarial
+> review (compile / async-chain / UAF-context / fail-safe) → **WILL_COMPILE_AND_SAFE, zero critical/important** (only doc nits, applied).
+>
+> **EXPERIMENTAL — unproven the IST PRO honours a bare CCC re-write after deep sleep.** The cure rate is an empirical unknown only an
+> on-device SOAK can settle (a few green runs prove nothing — the same trap that made `9cbc3ec` look fine for days). **Logging build,
+> uf2 sha256 `35cb5f553690cda1dfd71672f5185918a7922953ec0343966559e60a87c31cab`. NOT yet flashed.**
+>
+> **Soak protocol after flashing** (`bash ~/bin/flash-ist-logging.sh`): accumulate many real deep-sleep (`0x13`)/idle wakes. Watch for
+> `ZR_RESUBSCRIBE: live CCC re-write …` then within the verify window either `zombie-check OK rx+NN` (**CURED, no bounce** ✅) or a
+> `ZOMBIE … bounce` (kick didn't take → fell back, == v3.3). Success metric = a convincingly high **CURED-without-bounce rate** across
+> many wakes; HB `resub=N` counts total kicks. Must-not-regress: zero new permanent zombies (every episode ends CURED or bounced),
+> `-ENOMEM` logged + non-fatal, no hang/UAF. **If the peer ignores the CCC write → drop the rung (`resub_max=0`) and keep the bounce.**
+> Do NOT merge until the soak is convincing. Commit `7276e82`.
+>
+> _The v3.3 banner below remains valid (v3.4 is built ON v3.3's immediate-bounce ladder, adding the resubscribe rung in front)._
+
+> # ⛔→✅ v3.3 RE-ARM REVERTED + real root cause FOUND (2026-06-23 night). branch `feat/zombie-auto-recover`.
 > **The v3.2 re-arm (below) was flashed and DISPROVEN on-device, then reverted.** What we actually learned (this is the important part):
 >
 > **Real failure mode = a post-reconnect SILENCE, not "user hasn't moved yet."** Controlled grind tests (mouse power-cycled, user
