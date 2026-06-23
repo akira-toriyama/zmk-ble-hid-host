@@ -241,8 +241,12 @@ static bool zr_delay_rescan;       /* set before a zombie disconnect -> disconne
 static uint32_t zr_resub_attempts; /* live CCC re-subscribes used in the current episode */
 static uint32_t zr_resubs;         /* total resubscribe kicks (heartbeat diag) */
 static size_t zr_resub_idx;        /* which subscription the chain is currently kicking */
+static uint8_t zr_resub_phase;     /* edge step: 0 = writing CCC=0x0000 (disable), 1 = writing 0x0001 (enable) */
 static struct bt_gatt_write_params zr_ccc_wp;
-static uint8_t zr_ccc_val[2] = { BT_GATT_CCC_NOTIFY & 0xFFU, (BT_GATT_CCC_NOTIFY >> 8) & 0xFFU }; /* 0x0001 LE */
+static uint8_t zr_ccc_val[2];      /* CCC value for THIS write, set per phase (0x0000 LE then 0x0001 LE).
+				    * The edge matters: the reconnect's own subscribe already wrote CCC=0x0001,
+				    * so re-writing 0x0001 alone is a no-op (proven on-device 23:38); a real
+				    * 0->1 transition is what can re-trigger a peer whose notify-config drifted. */
 /* The single shared zr_ccc_wp is a one-in-flight buffer; a 2nd overlapping chain would mutate a
  * write-params still owned by an in-flight ATT request. ZR_RESUB_MAX==1 (one-shot) guarantees that. */
 BUILD_ASSERT(ZR_RESUB_MAX == 1U, "ZR_RESUB_MAX>1 needs an idle-gate on the shared zr_ccc_wp chain");
@@ -256,23 +260,33 @@ static void zr_ccc_write_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_wr
 	/* Runs on the BT RX wq (same wq as disconnected(), so default_conn can't be freed under us).
 	 * A benign err (peer NAK / write rejected) just advances the chain. */
 	if (err) {
-		LOG_WRN("resub: CCC write err 0x%02x at idx %u", err, (unsigned)zr_resub_idx);
+		LOG_WRN("resub: CCC write err 0x%02x at idx %u phase %u", err,
+			(unsigned)zr_resub_idx, (unsigned)zr_resub_phase);
 	}
-	zr_resub_idx++;
+	/* Per handle: phase 0 (just wrote 0x0000) -> phase 1 (write 0x0001 to the SAME handle);
+	 * phase 1 done -> next handle at phase 0. This forces the 0->1 edge a bare re-enable lacks. */
+	if (zr_resub_phase == 0U) {
+		zr_resub_phase = 1U;
+	} else {
+		zr_resub_phase = 0U;
+		zr_resub_idx++;
+	}
 	zr_resub_issue();
 }
 
 static void zr_resub_issue(void)
 {
-	/* Issue the next CCC=0x0001 write, or finish the chain. default_conn may have been cleared
-	 * on the BT RX wq (a disconnect mid-chain) -> stop; the verify window (already armed) then
-	 * falls through to the proven bounce. */
+	/* Issue the next CCC write (0x0000 then 0x0001 per handle), or finish the chain. default_conn
+	 * may have been cleared on the BT RX wq (a disconnect mid-chain) -> stop; the verify window
+	 * (already armed) then falls through to the proven bounce. */
 	if (!default_conn || zr_resub_idx >= sub_count) {
 		if (zr_resub_idx > 0) {
-			LOG_INF("resub: kicked %u CCC handle(s)", (unsigned)zr_resub_idx);
+			LOG_INF("resub: kicked %u CCC handle(s) (0->1 edge)", (unsigned)zr_resub_idx);
 		}
 		return;
 	}
+	zr_ccc_val[0] = (zr_resub_phase == 0U) ? 0x00U : (BT_GATT_CCC_NOTIFY & 0xFFU); /* 0x0000 then 0x0001 */
+	zr_ccc_val[1] = (zr_resub_phase == 0U) ? 0x00U : ((BT_GATT_CCC_NOTIFY >> 8) & 0xFFU);
 	zr_ccc_wp.func = zr_ccc_write_cb;
 	zr_ccc_wp.handle = subs[zr_resub_idx].params.ccc_handle;
 	zr_ccc_wp.offset = 0;
@@ -340,6 +354,7 @@ static void zombie_check_handler(struct k_work *work)
 		LOG_INF("ZR_RESUBSCRIBE: live CCC re-write on %u handle(s) (verify %us, disc=%d)",
 			(unsigned)sub_count, ZR_RESUB_VERIFY_MS / 1000U, (int)disc_state);
 		zr_resub_idx = 0;
+		zr_resub_phase = 0; /* start the 0->1 edge chain at the disable step */
 		if (sub_count > 0 && disc_state == DISC_IDLE) {
 			zr_resub_issue(); /* chain re-writes; the verify window judges the result */
 		}
@@ -1231,7 +1246,7 @@ static void start_work_handler(struct k_work *work)
 		zr_persist_magic = ZR_PERSIST_MAGIC;
 		zr_reboot_count = 0;
 	}
-	LOG_INF("ble_hid_host up (v3.4 live-resubscribe: resub_max=%u, 1st-bounce-immediate, "
+	LOG_INF("ble_hid_host up (v3.4.1 live-resubscribe 0->1 edge: resub_max=%u, 1st-bounce-immediate, "
 		"bounce_max=%u delay=%ums reboot_gate=%us budget=%u/%u)",
 		ZR_RESUB_MAX, ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U,
 		zr_reboot_count, ZR_REBOOT_BUDGET);
