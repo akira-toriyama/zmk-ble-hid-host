@@ -1,6 +1,39 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ✅ v3.2 RE-ARM (idle false-positive freeze fix) — BUILT, NOT YET FLASHED (2026-06-23 PM). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> # ⛔→✅ v3.3 RE-ARM REVERTED + real root cause FOUND (2026-06-23 night). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> **The v3.2 re-arm (below) was flashed and DISPROVEN on-device, then reverted.** What we actually learned (this is the important part):
+>
+> **Real failure mode = a post-reconnect SILENCE, not "user hasn't moved yet."** Controlled grind tests (mouse power-cycled, user
+> moving continuously from the instant of reconnect) + 3 days of logs: **~64% of wake-reconnects come up `conn=1 sub=5` (full
+> discovery + subscribe succeed) but stream ZERO HID notifications for ~4 s even while the mouse is being moved**, then a bounce
+> (disconnect+reconnect) flips it to `rx+120..267`. The silence is **binary** (rx stays at literally 0; there is no "almost flowing"
+> ramp) and is cured **only by the bounce — never by waiting.**
+>
+> **Decisive evidence that re-arm is wrong:** across all 8 v3.2 re-arm windows in the field, **every one read `re-arm rx+0` and was
+> immediately followed by a curative bounce, never by a `zombie-check OK` (waitingSelfResolvedCount = 0).** So the re-arm waited one
+> extra 2 s window that cured nothing and just added **~2 s of dead time before the bounce that actually fixes the freeze** — i.e.
+> v3.2 made the felt freeze ~2 s WORSE for the dominant mode (the grind tests froze ~7 s with re-arm; the user felt it: "2連続で発生").
+> The original 18:48 case that motivated v3.2 was a coincidence (a reconnect that happened to stream right after the bounce).
+>
+> **v3.3 (commit `09b8759`):** reverts the v3.2 re-arm code (byte-identical to v3.1 except the boot marker → `v3.3 re-arm-reverted`).
+> Back to the proven v3.1 ladder: **immediate 1st bounce, 2nd allowed, reboot reserved for the boot-storm path** — a bounce reliably
+> cures the silence in 1–2 bounces (25/27 silent episodes on 06-23). Host tests green; logging build for flashing.
+>
+> **What NOT to do (grounded):** do **NOT** shorten the 2 s detection window blindly — healthy-low first-window values (`rx 103/115`)
+> sit only ~12 notifications above silent-highs (`rx 85–91`), and the logs are 2 s-granularity so a 1 s window's false-positive rate
+> is unprovable; **100/2 s must stay.** Do **NOT** lower the threshold.
+>
+> **NEXT (the real latency win, separate R&D step):** a **no-disconnect live CCC re-subscribe** — re-write the CCC on the EXISTING
+> link to kick notifications without paying the disconnect+rescan+reconnect cost (most of the 4–7 s freeze). The silence is a
+> notification/CCC-delivery fault (subscribe succeeds, reports don't flow), exactly the class a live CCC re-write could clear. **GUARD
+> required:** a prior cached-resubscribe attempt (`9cbc3ec`) regressed → attempt one live re-write, verify rx advances within one short
+> window, and on ANY failure fall back to the proven bounce. Validate on logging firmware against grind tests before shipping.
+> **Method to characterize whether a shorter window is ever safe:** first instrument sub-2 s rx checkpoints (log rx at 1.0 s / 1.5 s)
+> to learn the healthy accumulation curve. Until then, latency is attacked via live-resubscribe, not window-shortening.
+>
+> _The v3.2 banner below is kept as the investigation record (how we got here), not current guidance._
+
+> # ⛔ v3.2 RE-ARM (REVERTED — investigation record, superseded by v3.3 above). branch `feat/zombie-auto-recover`.
 > **Problem:** the daily "ON → 一瞬固まる → 動き出す" freeze. Reproduced live (18:48): mouse OFF→ON (`gap=21s`) → first 2 s window
 > `rx+0` → **bounce a HEALTHY link** → `gap=0` reconnect → `rx+108` OK. A HID mouse only emits notifications on motion, so a
 > reconnected-but-not-yet-moved link reads `rx+0` and is mis-flagged a zombie. **Proof it was a false positive, not a real zombie:**
