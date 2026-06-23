@@ -15,17 +15,22 @@
 > v3.5 ALSO drops the lingering v3.4.1 ~2 s penalty (the device currently still runs v3.4.1) and puts it back on the v3.3
 > immediate-bounce ladder.
 >
-> **Logging build, uf2 sha256 `ddeffc019d80c9b32b6da6b0e52f881001911032a1445304d7c177617b2fe78f`. NOT yet flashed.** Boot marker:
-> `ble_hid_host up (v3.5 probe=v3.3 bounce + sub-2s rx checkpoints …)`. Verified embedded in the ELF; old `v3.4.2 resub-removed`
-> marker gone. **Adversarial review:** 4-lens panel (concurrency/UAF · BLE-timing · no-behaviour-change · arithmetic-edge) + a
+> **Logging build, uf2 sha256 `ddeffc019d80c9b32b6da6b0e52f881001911032a1445304d7c177617b2fe78f`. ✅ FLASHED + LIVE (2026-06-24
+> 08:55).** Confirmed running on-device by the v3.5-only `zombie-probe @…ms` lines (the boot marker itself fell in the known
+> USB-re-enumeration capture gap, but the probe lines + sha are proof) and by the post-reboot HB dropping the `resub=` field (v3.4
+> revert is in effect). Owner: "ドングルマウス 動作OK" — no behaviour regression. **First field sample (a HEALTHY reconnect, mouse
+> moving):** `@500ms rx+66 · @1000ms rx+134 · @1500ms rx+201 · @2000ms rx+264 → zombie-check OK`. So this healthy reconnect crossed
+> ZR_MIN_RX (=100) between 500 and 1000 ms — promising for a future ~1 s window, but ONE sample proves nothing; need many healthy
+> samples AND silent episodes (must stay rx+0 at 500/1000/1500 ms) before any window change. **Adversarial review:** 4-lens panel
+> (concurrency/UAF · BLE-timing · no-behaviour-change · arithmetic-edge) + a
 > synthesizer all returned **safe-to-flash, no-behaviour-change, zero critical/important** (the synth cross-checked the built
 > `.config`: system-wq prio −1 < BT-RX −8, single-core cooperative, `LOG_MODE_DEFERRED` → `LOG_INF` copies-and-returns off the
 > GATT path). The 5th lens (work-lifecycle) stalled on infra; its invariant was verified by hand instead — `zombie_check_work` has
 > exactly two lifecycle ops (arm @ the subscribe site, cancel @ `disconnected()`), each paired 1:1 with a `zr_probe_work` op, and
 > the self-reschedule terminates via two `ARRAY_SIZE` guards (idx 0→3 then stops).
 >
-> **Next session step 1 = flash v3.5** (`bash ~/bin/flash-ist-logging.sh`, owner double-taps). Then SOAK over days: collect many
-> real deep-sleep (`0x13`) / idle wakes and read the `zombie-probe @…ms: rx+NN` lines. ANALYSIS GOAL = does a healthy reconnect
+> **Next = SOAK (flashed 2026-06-24; re-flash via `bash ~/bin/flash-ist-logging.sh` if the dongle is replaced).** Over days collect
+> many real deep-sleep (`0x13`) / idle wakes and read the `zombie-probe @…ms: rx+NN` lines. ANALYSIS GOAL = does a healthy reconnect
 > cross ~100 well before 2000 ms, AND do silent episodes stay at rx+0 at 500/1000/1500 ms too? If healthy crosses ~100 by e.g.
 > 1000 ms with a clean margin over silent-highs, THEN (and only then) adopt a shorter window + proportional threshold (v3.6) to
 > cut the ~4–7 s freeze. If the bands overlap at sub-2 s, the 2 s window stays — and we've learned the floor is real. Until the
