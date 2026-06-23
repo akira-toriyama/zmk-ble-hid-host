@@ -11,6 +11,14 @@ enum zr_action zr_decide(const struct zr_ctx *c)
     if (c->rx_delta >= c->rx_min) {
         return ZR_OK_RESET; /* flowing */
     }
+    if (c->resub_attempts < c->resub_max) {
+        /* The post-reconnect zombie is a peer whose notification config (CCC) drifted:
+         * the link is up + subscribed but streams 0 reports. Try a cheap over-air CCC
+         * re-write on the LIVE link (no disconnect) ONCE before paying the bounce's
+         * reconnect cost. If it doesn't restore flow, the verify window falls through
+         * here again with resub_attempts spent -> the proven bounce. */
+        return ZR_RESUBSCRIBE;
+    }
     if (c->bounce_attempts < c->bounce_max) {
         return ZR_DELAYED_BOUNCE; /* still have light retries */
     }

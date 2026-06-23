@@ -16,7 +16,10 @@ static int failures;
         }                                                                                          \
     } while (0)
 
-/* Baseline healthy-mid-session context; tests override the fields they exercise. */
+/* Baseline healthy-mid-session context; tests override the fields they exercise.
+ * Live-resubscribe is DISABLED here (resub_max = 0 == prior behaviour) so the existing
+ * bounce/reboot-ladder tests below exercise the same rungs as before; the resubscribe
+ * tests opt in explicitly with resub_max = 1. */
 static struct zr_ctx base(void) {
     struct zr_ctx c = {
         .rx_delta = 0, .rx_min = 100,
@@ -24,6 +27,7 @@ static struct zr_ctx base(void) {
         .uptime_ms = 600000, .reboot_min_uptime_ms = 60000,
         .reboot_count = 0, .reboot_budget = 2,
         .healthy_since_boot = true,
+        .resub_attempts = 0, .resub_max = 0,
     };
     return c;
 }
@@ -72,6 +76,32 @@ int main(void) {
     { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 3; CHECK(zr_decide(&c) == ZR_REBOOT); }
     { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 3; c.healthy_since_boot = false;
       CHECK(zr_decide(&c) == ZR_GIVE_UP); }
+
+    /* --- #8 v3.4: live CCC re-subscribe rung, ONE-SHOT before the bounce ---
+     * The post-reconnect zombie (conn up, subscribed, but 0 notifications) is cured by an
+     * over-air CCC re-write. Try that cheap, no-disconnect kick ONCE before paying the
+     * bounce's reconnect cost; if it doesn't restore flow, fall through to the proven bounce. */
+
+    /* fresh zombie, resubscribe budget available -> RESUBSCRIBE (tried BEFORE any bounce) */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.resub_max = 1; c.resub_attempts = 0;
+      CHECK(zr_decide(&c) == ZR_RESUBSCRIBE); }
+    { struct zr_ctx c = base(); c.rx_delta = 88; c.resub_max = 1; c.resub_attempts = 0;
+      CHECK(zr_decide(&c) == ZR_RESUBSCRIBE); }
+
+    /* one-shot boundary: the resubscribe was spent and the verify window is still silent ->
+     * fall through to the bounce ladder (never a 2nd resubscribe in one episode) */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.resub_max = 1; c.resub_attempts = 1;
+      c.bounce_attempts = 0; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
+
+    /* precedence: flow seen during the verify window -> OK_RESET; resubscribe never preempts
+     * a recovered link */
+    { struct zr_ctx c = base(); c.rx_delta = 250; c.resub_max = 1; c.resub_attempts = 0;
+      CHECK(zr_decide(&c) == ZR_OK_RESET); }
+
+    /* resub_max = 0 disables the rung == prior v3.3 behaviour (no regression): a fresh zombie
+     * goes straight to the bounce */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.resub_max = 0; c.resub_attempts = 0;
+      c.bounce_attempts = 0; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
 
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("all policy tests passed\n");
