@@ -22,6 +22,7 @@ static struct zr_ctx base(void) {
         .rx_delta = 0, .rx_min = 100,
         .bounce_attempts = 0, .bounce_max = 2,
         .uptime_ms = 600000, .reboot_min_uptime_ms = 60000,
+        .reboot_count = 0, .reboot_budget = 2,
         .healthy_since_boot = true,
     };
     return c;
@@ -45,6 +46,31 @@ int main(void) {
 
     /* bounces exhausted, healthy, but uptime below gate -> GIVE_UP (too early to reboot) */
     { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 2; c.uptime_ms = 30000;
+      CHECK(zr_decide(&c) == ZR_GIVE_UP); }
+
+    /* reboot BUDGET gate (#8 freeze fix: rate-limit USB-re-enumeration reboots).
+     * Otherwise-eligible reboot is suppressed once the budget is spent -> GIVE_UP. */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 2;
+      c.reboot_count = 2; c.reboot_budget = 2; CHECK(zr_decide(&c) == ZR_GIVE_UP); }
+    /* budget remaining -> still reboots */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 2;
+      c.reboot_count = 1; c.reboot_budget = 2; CHECK(zr_decide(&c) == ZR_REBOOT); }
+    /* count over budget (defensive) -> GIVE_UP */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 2;
+      c.reboot_count = 5; c.reboot_budget = 2; CHECK(zr_decide(&c) == ZR_GIVE_UP); }
+
+    /* precedence: a FLOWING link returns OK_RESET even with bounces exhausted AND the
+     * reboot path otherwise armed -> the ladder must never reboot a recovered link. */
+    { struct zr_ctx c = base(); c.rx_delta = 300; c.bounce_attempts = 2; CHECK(zr_decide(&c) == ZR_OK_RESET); }
+    { struct zr_ctx c = base(); c.rx_delta = 100; c.bounce_attempts = 2; CHECK(zr_decide(&c) == ZR_OK_RESET); }
+
+    /* uptime gate boundary: exactly == gate -> REBOOT (>=, not >) */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 2; c.uptime_ms = 60000;
+      CHECK(zr_decide(&c) == ZR_REBOOT); }
+
+    /* attempts strictly past max still escalates (no off-by-one re-running the ladder) */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 3; CHECK(zr_decide(&c) == ZR_REBOOT); }
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 3; c.healthy_since_boot = false;
       CHECK(zr_decide(&c) == ZR_GIVE_UP); }
 
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }

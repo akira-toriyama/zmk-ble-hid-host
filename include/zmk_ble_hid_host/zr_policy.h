@@ -24,8 +24,10 @@ struct zr_ctx {
     uint32_t rx_min;               /* ZR_MIN_RX: >= this in the window == flowing */
     uint32_t bounce_attempts;      /* delayed bounces already used this episode */
     uint32_t bounce_max;           /* ZR_BOUNCE_MAX */
-    uint32_t uptime_ms;            /* milliseconds since boot */
+    uint32_t uptime_ms;            /* milliseconds since boot (k_uptime_get_32; wraps ~49.7d, benign) */
     uint32_t reboot_min_uptime_ms; /* ZR_REBOOT_MIN_UPTIME_MS: gate before any reboot */
+    uint32_t reboot_count;         /* self-reboots already spent this streak (retained across reboots) */
+    uint32_t reboot_budget;        /* ZR_REBOOT_BUDGET: max reboots before GIVE_UP (rate-limit) */
     bool healthy_since_boot;       /* the link streamed healthily at least once this boot */
 };
 
