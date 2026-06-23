@@ -153,14 +153,20 @@ static uint16_t cur_latency = 0xFFFF;
  * reports arrives, then rx_notif goes flat while the LL link stays up) is cured by a
  * fresh reconnect -- owner-confirmed 2026-06-22: a DONGLE re-plug revives it with NO
  * mouse power-cycle. So detect it and force a fresh reconnect ourselves. Detection arms
- * on EVERY reconnect: the zombie is PROBABILISTIC, not duration-gated (a 79s sleep
- * zombied while a 78s one didn't, so the old >=90s deep-gate MISSED zombies -- removed).
+ * on EVERY reconnect: the zombie is PROBABILISTIC, not duration-gated.
  * Reconnect storms are safe: each reconnect k_work_reschedule()s the single check, so only
- * the post-storm check fires (no bounce spam). ZR_WINDOW_MS after the reconnect, if rx_notif climbed
- * < ZR_MIN_RX (a zombie only ever shows the ~88 flush burst), bt_conn_disconnect to force a
- * reconnect, up to ZR_MAX_BOUNCE times, then give up until the next wake. v1 = LIGHT
- * bounce (no sys_reboot) -- also tests whether a dongle-initiated reconnect (not a full
- * reboot) clears the zombie. INF logging only (NO verbose BT DBG, which breaks timing). */
+ * the post-storm check fires (no bounce spam).
+ *
+ * v3 escalation ladder (zr_decide()):
+ *   1. ZR_OK: healthy (rx_delta >= ZR_MIN_RX) -> mark healthy_since_boot, reset state.
+ *   2. ZR_DELAYED_BOUNCE: zombie detected, bounces < ZR_BOUNCE_MAX -> bt_conn_disconnect,
+ *      re-scan after ZR_BOUNCE_DELAY_MS (gives the peer time to fully reset between tries).
+ *   3. ZR_REBOOT: zombie persists after ZR_BOUNCE_MAX delayed bounces AND the link was
+ *      healthy at least once this boot AND uptime >= ZR_REBOOT_MIN_UPTIME_MS ->
+ *      sys_reboot(SYS_REBOOT_WARM) last resort (bond in NVS; auto-reconnects after boot).
+ *   4. ZR_GIVE_UP: reboot guard not met (too early in boot, or never healthy) -> log + stop.
+ *
+ * INF logging only (NO verbose BT DBG, which breaks BLE timing). */
 #define ZR_WINDOW_MS  2000U   /* v2: 2 s (was 10 s) -- the aggressive-but-safe LIMIT for this
 				* count-detector. Data (~/zmk-logs 2026-06-22): healthy reconnects added
 				* 246-598 rx in 10 s; zombies added 0 or 88 (the flush burst, lands <1 s).
@@ -220,12 +226,11 @@ static void zombie_check_handler(struct k_work *work)
 		bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		return;
 	case ZR_REBOOT:
-		LOG_WRN("ZOMBIE persists after %u bounces (up=%us, healthy_since_boot=1) -> self-reboot",
+		LOG_WRN("ZOMBIE persists after %u bounces (up=%us, healthy_since_boot=1) -> self-reboot now",
 			zr_attempts, k_uptime_get_32() / 1000U);
-		/* implemented in Task 3 */
-		zr_recovering = false;
-		zr_attempts = 0;
-		return;
+		k_msleep(50);          /* let the log line flush over USB-CDC before reset */
+		sys_reboot(SYS_REBOOT_WARM);
+		return;                /* unreachable */
 	case ZR_GIVE_UP:
 	default:
 		LOG_WRN("ZOMBIE persists after %u bounces -> giving up until next wake "
@@ -1052,6 +1057,8 @@ static void start_work_handler(struct k_work *work)
 	LOG_INF("ble-hid-host central up on %s (filter: %s)",
 		host_dev ? host_dev->name : "?",
 		name_filter ? name_filter : "<any HOGP pointer>");
+	LOG_INF("ble_hid_host up (v3 escalation: bounce_max=%u delay=%ums reboot_gate=%us)",
+		ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U);
 	start_scan();
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60)); /* #8: arm idle heartbeat */
 }
