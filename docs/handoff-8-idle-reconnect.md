@@ -1,6 +1,42 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ✅ v3.1 FREEZE-FIX SHIPPED TO DEVICE (2026-06-23 PM) — READ THIS FIRST. branch `fix/8-recovery-disruption`, FLASHED + monitoring.
+> # ✅ v3.2 RE-ARM (idle false-positive freeze fix) — BUILT, NOT YET FLASHED (2026-06-23 PM). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> **Problem:** the daily "ON → 一瞬固まる → 動き出す" freeze. Reproduced live (18:48): mouse OFF→ON (`gap=21s`) → first 2 s window
+> `rx+0` → **bounce a HEALTHY link** → `gap=0` reconnect → `rx+108` OK. A HID mouse only emits notifications on motion, so a
+> reconnected-but-not-yet-moved link reads `rx+0` and is mis-flagged a zombie. **Proof it was a false positive, not a real zombie:**
+> a `gap=0` bounce cannot cure a genuine zombie (known fact), yet it recovered right after one → the link was already healthy; the
+> user simply started moving. So the felt freeze = v3.1 bouncing an idle-but-healthy reconnect.
+>
+> **Fix = bounded re-arm (debounce), `ZR_REARM_MAX=1`:** on the FIRST sub-threshold window of an episode, **re-arm one more window
+> WITHOUT disconnecting** instead of bouncing. Motion in the next window → healthy → **no disconnect, no freeze.** A genuine zombie
+> stays silent across the re-arm and still bounces ~one window later (v3.1's immediate `gap=0` bounce was already non-curative for
+> genuine zombies, so real recovery is ~unchanged; only the curative 5 s-delayed bounce shifts ~2 s later). The arm snapshot is kept
+> across the re-arm → the 2nd window's delta is **cumulative (effective 2× window)**, which also absorbs the `rx+80..99` band.
+>
+> **Sizing (3 days of `~/zmk-logs`, 42 zombie episodes):** **17/42 (~40%) were false positives a K=1 re-arm would have eliminated**
+> entirely (15 idle `rx+0` that recovered on the immediate bounce + 2 low-rx `rx+81/88`). **K=2 buys nothing** (genuine zombies stay
+> `rx+0` across any number of windows) → `ZR_REARM_MAX=1`. Cost to genuine zombies ≈ one window (~2 s) of deferred bounce, mostly
+> notional. Confidence moderate (3 firmware variants + capture gaps in the window); **17 is a floor** (some give-ups were likely idle too).
+>
+> **Code (policy/mechanism split kept):** `zr_policy.c` gains a pure `ZR_REARM` rung (before the bounce rung) gated on
+> `rearms_used < rearm_max`; `rearm_max=0` == **exact v3.1** (no-regression). `hog_central.c`: `zr_rearms` episode counter (reset on
+> every episode boundary, **kept across a bounce's own reconnect** so no re-arm follows a bounce), `ZR_REARM` case re-schedules
+> `zombie_check_work` without disconnecting and leaves `zr_rx_at_arm` untouched, HB adds `ra=`, boot marker → **v3.2**.
+>
+> **Verification:** host policy tests green (`-Werror`; 5 new RED→GREEN re-arm tests, existing tests unchanged). **Adversarial
+> multi-lens review** (compile / state-machine / BLE-behavior / regression) → **1 critical found+fixed** (forward-declare
+> `zombie_check_work` so the handler can re-arm itself — was an undeclared-identifier compile error), all 12 other findings
+> dismissed (state machine verified: no infinite re-arm, ladder still terminates, `rearm_max=0` == v3.1). **Logging build green**
+> (FLASH 30.39%), **uf2 sha256 `4eb23f41a44cc8afcdce468afb2eaaa3a0bd1ba572cb01e739ad9a2417b3a0ab`** (v3.2 markers verified
+> embedded: boot line, `zombie-check re-arm`, HB `ra=`).
+>
+> **Status: NOT yet flashed — owner flashes.** `bash ~/bin/flash-ist-logging.sh` (double-tap the dongle reset; uses `cat`). Then
+> **observe over days** (じっくり, owner: "1つの結果で決めない / 日々の積み重ねで改善"): confirm the idle freeze is gone (a `zombie-check
+> re-arm 1/1` followed by `OK` instead of a `bounce`), and that genuine zombies still recover within the (now ~2 s later) bounce.
+> Endgame unchanged (Plan A): if observation stays good → un-draft PR #15 + merge to `main`, keep the LOGGING variant on-device.
+> **Build recipe / flash / monitoring are below in the v3.1 banner — unchanged.**
+
+> # ✅ v3.1 FREEZE-FIX SHIPPED TO DEVICE (2026-06-23 PM). branch `fix/8-recovery-disruption`, FLASHED + monitoring.
 > **Why:** after v3 was flashed, the owner reported **"mouse freezes increased."** Field logs (`~/zmk-logs/zmk-2026-06-23.log`,
 > v3 running) confirmed it was **NOT a new bug** but v3's recovery being **more disruptive than v2**, applied to the same
 > genuine zombies (rx+0 dominant — 16/20 ZOMBIE lines were `rx+0<100`, i.e. real "connected+subscribed but zero flow",
