@@ -14,7 +14,6 @@
 
 enum zr_action {
     ZR_OK_RESET,       /* link is flowing -> clear recovery state */
-    ZR_RESUBSCRIBE,    /* over-air CCC re-write on the live link (no disconnect) before bouncing */
     ZR_DELAYED_BOUNCE, /* disconnect, then re-scan after a delay (let the peer reset) */
     ZR_REBOOT,         /* self-reboot the dongle (== the known re-plug cure) */
     ZR_GIVE_UP,        /* stop; wait for the next natural wake (no reboot loop) */
@@ -25,8 +24,6 @@ struct zr_ctx {
     uint32_t rx_min;               /* ZR_MIN_RX: >= this in the window == flowing */
     uint32_t bounce_attempts;      /* delayed bounces already used this episode */
     uint32_t bounce_max;           /* ZR_BOUNCE_MAX */
-    uint32_t resub_attempts;       /* live CCC re-subscribes already used this episode */
-    uint32_t resub_max;            /* ZR_RESUB_MAX: re-subscribe tries before a bounce (0 = disabled) */
     uint32_t uptime_ms;            /* milliseconds since boot (k_uptime_get_32; wraps ~49.7d, benign) */
     uint32_t reboot_min_uptime_ms; /* ZR_REBOOT_MIN_UPTIME_MS: gate before any reboot */
     uint32_t reboot_count;         /* self-reboots already spent this streak (retained across reboots) */

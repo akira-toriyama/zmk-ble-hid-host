@@ -157,19 +157,15 @@ static uint16_t cur_latency = 0xFFFF;
  * Reconnect storms are safe: each reconnect k_work_reschedule()s the single check, so only
  * the post-storm check fires (no bounce spam).
  *
- * v3.4 escalation ladder (zr_decide()):
+ * v3 escalation ladder (zr_decide()):
  *   1. ZR_OK: healthy (rx_delta >= ZR_MIN_RX) -> mark healthy_since_boot, reset state.
- *   2. ZR_RESUBSCRIBE: zombie + resub_attempts < ZR_RESUB_MAX -> re-write each report's CCC
- *      over-air on the LIVE link (no disconnect), re-arm a verify window. One-shot per episode;
- *      if the verify window is still silent it falls through to the bounce. EXPERIMENTAL (the
- *      bounce remains the proven floor) -- see zr_resub_issue() / ZR_RESUB_MAX.
- *   3. ZR_DELAYED_BOUNCE: zombie detected, bounces < ZR_BOUNCE_MAX -> bt_conn_disconnect.
+ *   2. ZR_DELAYED_BOUNCE: zombie detected, bounces < ZR_BOUNCE_MAX -> bt_conn_disconnect.
  *      The 1st bounce re-scans IMMEDIATELY (most zombies clear on one bounce); the 2nd+
  *      bounce delays the re-scan by ZR_BOUNCE_DELAY_MS so a stubborn peer fully resets.
- *   4. ZR_REBOOT: zombie persists after ZR_BOUNCE_MAX bounces AND the link was healthy at
+ *   3. ZR_REBOOT: zombie persists after ZR_BOUNCE_MAX bounces AND the link was healthy at
  *      least once this boot AND uptime >= ZR_REBOOT_MIN_UPTIME_MS AND the reboot budget is
  *      not spent -> sys_reboot(SYS_REBOOT_WARM) last resort (bond in NVS; auto-reconnects).
- *   5. ZR_GIVE_UP: reboot guard not met (too early, never healthy, or budget spent) -> stop.
+ *   4. ZR_GIVE_UP: reboot guard not met (too early, never healthy, or budget spent) -> stop.
  *
  * INF logging only (NO verbose BT DBG, which breaks BLE timing). */
 #define ZR_WINDOW_MS  2000U   /* detection window. Data (~/zmk-logs, measured at the 10 s window):
@@ -187,15 +183,6 @@ static uint16_t cur_latency = 0xFFFF;
 				* but needs on-device validation. Watch ZOMBIE rx+NN<100 with NN in 30-99
 				* immediately followed by healthy: if frequent, this threshold/window need
 				* re-tuning. */
-#define ZR_RESUB_MAX             1U      /* #8 v3.4: live over-air CCC re-writes tried before the first
-					 * bounce. The post-reconnect zombie is a peer whose CCC (notify
-					 * enable) drifted (link up + subscribed but 0 reports); a CCC
-					 * re-write on the LIVE link can re-arm it WITHOUT the disconnect+
-					 * reconnect cost of a bounce. One-shot: if the verify window is
-					 * still silent, fall through to the proven bounce. EXPERIMENTAL --
-					 * unproven the IST PRO honours a bare CCC re-write after deep sleep;
-					 * the bounce fallback makes worst-case == prior behaviour. */
-#define ZR_RESUB_VERIFY_MS       ZR_WINDOW_MS /* after the kick, re-arm a detection window to verify flow */
 #define ZR_BOUNCE_MAX            2U      /* bounces before escalating to reboot */
 #define ZR_BOUNCE_DELAY_MS       5000U   /* re-scan delay AFTER the 2nd+ bounce (peer reset); the 1st
 					 * bounce re-scans immediately -- see disconnected() */
@@ -221,89 +208,6 @@ static uint32_t zr_bounces;    /* total auto-recover bounces (heartbeat diag) */
 static bool zr_healthy_since_boot; /* link streamed healthily at least once this boot (reboot guard) */
 static bool zr_delay_rescan;       /* set before a zombie disconnect -> disconnected() may delay re-scan */
 
-/* #8 v3.4 live CCC re-subscribe: re-write each report's CCC (notify-enable) over-air on the
- * EXISTING link to re-arm a peer whose CCC drifted, WITHOUT a disconnect. Tried once per episode
- * before the bounce (see ZR_RESUBSCRIBE). Kicks are CHAINED one-at-a-time (each write issued from
- * the previous write's response) to avoid the ATT/L2CAP TX-pool exhaustion (-ENOMEM) a synchronous
- * burst of 5 writes hit historically. A DEDICATED write-params + value buffer is used so
- * subs[].params (its value_handle/notify routing) is NEVER aliased. NOTE: a plain bt_gatt_subscribe
- * re-call returns -EALREADY and writes nothing over-air -- that host-local-only path is exactly what
- * regressed before (9cbc3ec); a direct CCC write is the real over-air re-arm.
- *
- * CONCURRENCY: zr_resub_idx and the single shared zr_ccc_wp cross two cooperative contexts -- the
- * system wq (zombie_check_handler sets idx=0 and issues write[0] without yielding) and the BT RX wq
- * (zr_ccc_write_cb advances idx + issues the next). They are safe ONLY under this build's cooperative
- * single-core model (neither wq preempts the other; bt_gatt_write only enqueues, never sleeps) AND
- * because the chain is strictly one-in-flight and ZR_RESUB_MAX==1 makes it one-shot (the verify tick
- * with resub_attempts==1 returns ZR_DELAYED_BOUNCE, never a 2nd overlapping chain). Same cooperative
- * assumption as the default_conn note in the handler. If the build ever gains preemption/SMP or
- * ZR_RESUB_MAX is raised, gate chain (re)start on the chain being idle. */
-static uint32_t zr_resub_attempts; /* live CCC re-subscribes used in the current episode */
-static uint32_t zr_resubs;         /* total resubscribe kicks (heartbeat diag) */
-static size_t zr_resub_idx;        /* which subscription the chain is currently kicking */
-static uint8_t zr_resub_phase;     /* edge step: 0 = writing CCC=0x0000 (disable), 1 = writing 0x0001 (enable) */
-static struct bt_gatt_write_params zr_ccc_wp;
-static uint8_t zr_ccc_val[2];      /* CCC value for THIS write, set per phase (0x0000 LE then 0x0001 LE).
-				    * The edge matters: the reconnect's own subscribe already wrote CCC=0x0001,
-				    * so re-writing 0x0001 alone is a no-op (proven on-device 23:38); a real
-				    * 0->1 transition is what can re-trigger a peer whose notify-config drifted. */
-/* The single shared zr_ccc_wp is a one-in-flight buffer; a 2nd overlapping chain would mutate a
- * write-params still owned by an in-flight ATT request. ZR_RESUB_MAX==1 (one-shot) guarantees that. */
-BUILD_ASSERT(ZR_RESUB_MAX == 1U, "ZR_RESUB_MAX>1 needs an idle-gate on the shared zr_ccc_wp chain");
-
-static void zr_resub_issue(void);
-
-static void zr_ccc_write_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_write_params *params)
-{
-	ARG_UNUSED(conn);
-	ARG_UNUSED(params);
-	/* Runs on the BT RX wq (same wq as disconnected(), so default_conn can't be freed under us).
-	 * A benign err (peer NAK / write rejected) just advances the chain. */
-	if (err) {
-		LOG_WRN("resub: CCC write err 0x%02x at idx %u phase %u", err,
-			(unsigned)zr_resub_idx, (unsigned)zr_resub_phase);
-	}
-	/* Per handle: phase 0 (just wrote 0x0000) -> phase 1 (write 0x0001 to the SAME handle);
-	 * phase 1 done -> next handle at phase 0. This forces the 0->1 edge a bare re-enable lacks. */
-	if (zr_resub_phase == 0U) {
-		zr_resub_phase = 1U;
-	} else {
-		zr_resub_phase = 0U;
-		zr_resub_idx++;
-	}
-	zr_resub_issue();
-}
-
-static void zr_resub_issue(void)
-{
-	/* Issue the next CCC write (0x0000 then 0x0001 per handle), or finish the chain. default_conn
-	 * may have been cleared on the BT RX wq (a disconnect mid-chain) -> stop; the verify window
-	 * (already armed) then falls through to the proven bounce. */
-	if (!default_conn || zr_resub_idx >= sub_count) {
-		if (zr_resub_idx > 0) {
-			LOG_INF("resub: kicked %u CCC handle(s) (0->1 edge)", (unsigned)zr_resub_idx);
-		}
-		return;
-	}
-	zr_ccc_val[0] = (zr_resub_phase == 0U) ? 0x00U : (BT_GATT_CCC_NOTIFY & 0xFFU); /* 0x0000 then 0x0001 */
-	zr_ccc_val[1] = (zr_resub_phase == 0U) ? 0x00U : ((BT_GATT_CCC_NOTIFY >> 8) & 0xFFU);
-	zr_ccc_wp.func = zr_ccc_write_cb;
-	zr_ccc_wp.handle = subs[zr_resub_idx].params.ccc_handle;
-	zr_ccc_wp.offset = 0;
-	zr_ccc_wp.data = zr_ccc_val;
-	zr_ccc_wp.length = sizeof(zr_ccc_val);
-	int err = bt_gatt_write(default_conn, &zr_ccc_wp);
-	if (err) {
-		/* -ENOMEM (TX pool full) / -ENOTCONN: stop the chain, do NOT retry-storm. The verify
-		 * window falls through to the bounce, so this degrades to prior (pre-v3.4) behaviour. */
-		LOG_WRN("resub: bt_gatt_write idx %u err %d -> stop; bounce will cover",
-			(unsigned)zr_resub_idx, err);
-	}
-}
-
-/* Forward-declare so the handler can re-arm its OWN work item (the verify window after a kick). */
-static void zombie_check_handler(struct k_work *work);
-static K_WORK_DELAYABLE_DEFINE(zombie_check_work, zombie_check_handler);
 static void zombie_check_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -329,8 +233,6 @@ static void zombie_check_handler(struct k_work *work)
 		.reboot_count = zr_reboot_count,
 		.reboot_budget = ZR_REBOOT_BUDGET,
 		.healthy_since_boot = zr_healthy_since_boot,
-		.resub_attempts = zr_resub_attempts,
-		.resub_max = ZR_RESUB_MAX,
 	};
 
 	switch (zr_decide(&ctx)) {
@@ -338,26 +240,7 @@ static void zombie_check_handler(struct k_work *work)
 		zr_healthy_since_boot = true;
 		zr_recovering = false;
 		zr_attempts = 0;
-		zr_resub_attempts = 0;
 		LOG_INF("zombie-check OK: rx+%u in %us (flowing)", delta, ZR_WINDOW_MS / 1000U);
-		break;
-	case ZR_RESUBSCRIBE:
-		/* #8 v3.4: cure WITHOUT a disconnect -- re-write each report's CCC over-air on the
-		 * live link, then re-arm a verify window. zr_rx_at_arm is re-snapshotted so the verify
-		 * measures NEW flow. NO disconnect, subs[]/sub_count untouched: a failed/ignored kick
-		 * leaves exactly the conn=1 sub=N state the detector already handles -> next tick spends
-		 * resub_attempts and falls through to the proven bounce (worst-case == prior behaviour). */
-		zr_resub_attempts++;
-		zr_resubs++;
-		zr_rx_at_arm = rx_notif;
-		k_work_reschedule(&zombie_check_work, K_MSEC(ZR_RESUB_VERIFY_MS));
-		LOG_INF("ZR_RESUBSCRIBE: live CCC re-write on %u handle(s) (verify %us, disc=%d)",
-			(unsigned)sub_count, ZR_RESUB_VERIFY_MS / 1000U, (int)disc_state);
-		zr_resub_idx = 0;
-		zr_resub_phase = 0; /* start the 0->1 edge chain at the disable step */
-		if (sub_count > 0 && disc_state == DISC_IDLE) {
-			zr_resub_issue(); /* chain re-writes; the verify window judges the result */
-		}
 		break;
 	case ZR_DELAYED_BOUNCE:
 		zr_attempts++;
@@ -373,7 +256,6 @@ static void zombie_check_handler(struct k_work *work)
 			LOG_WRN("ZOMBIE bounce: conn already gone");
 			zr_recovering = false;
 			zr_attempts = 0;
-			zr_resub_attempts = 0;
 			zr_delay_rescan = false;
 		}
 		break;
@@ -397,11 +279,11 @@ static void zombie_check_handler(struct k_work *work)
 			zr_reboot_count, ZR_REBOOT_BUDGET);
 		zr_recovering = false;
 		zr_attempts = 0;
-		zr_resub_attempts = 0;
 		break;
 	}
 	bt_conn_unref(c);
 }
+static K_WORK_DELAYABLE_DEFINE(zombie_check_work, zombie_check_handler);
 
 static void report_work_handler(struct k_work *work)
 {
@@ -744,7 +626,6 @@ static void subscribe_pending(struct bt_conn *conn)
 			 * zr_recovering can't carry a stale count into it and skip rungs to a reboot. */
 			if (!zr_recovering || gap > (ZR_BOUNCE_DELAY_MS + ZR_WINDOW_MS + 3000U)) {
 				zr_attempts = 0;
-				zr_resub_attempts = 0; /* fresh episode -> fresh resubscribe budget */
 				zr_recovering = false;
 			}
 			zr_rx_at_arm = rx_notif;
@@ -1006,11 +887,11 @@ static void heartbeat_handler(struct k_work *work)
 	/* rec/att/reboots surface a recovery-in-progress so the 5 s post-bounce window and a
 	 * recovering link aren't mis-read as idle-death by the observation protocol. */
 	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u rx_notif=%u pub=%u "
-		"lat=%u zr=%u rec=%d att=%u resub=%u reboots=%u",
+		"lat=%u zr=%u rec=%d att=%u reboots=%u",
 		k_uptime_get_32() / 1000U, default_conn ? 1 : 0,
 		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails,
 		rx_notif, pub_reports, cur_latency, zr_bounces,
-		zr_recovering ? 1 : 0, zr_attempts, zr_resubs, zr_reboot_count);
+		zr_recovering ? 1 : 0, zr_attempts, zr_reboot_count);
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60));
 }
 
@@ -1149,7 +1030,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		 * zr_recovering can't carry a stale attempt count into the next reconnect. */
 		zr_recovering = false;
 		zr_attempts = 0;
-		zr_resub_attempts = 0;
 		start_scan();
 	}
 }
@@ -1246,9 +1126,9 @@ static void start_work_handler(struct k_work *work)
 		zr_persist_magic = ZR_PERSIST_MAGIC;
 		zr_reboot_count = 0;
 	}
-	LOG_INF("ble_hid_host up (v3.4.1 live-resubscribe 0->1 edge: resub_max=%u, 1st-bounce-immediate, "
-		"bounce_max=%u delay=%ums reboot_gate=%us budget=%u/%u)",
-		ZR_RESUB_MAX, ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U,
+	LOG_INF("ble_hid_host up (v3.4.2 resub-removed=v3.3 bounce: 1st-bounce-immediate, bounce_max=%u delay=%ums "
+		"reboot_gate=%us budget=%u/%u)",
+		ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U,
 		zr_reboot_count, ZR_REBOOT_BUDGET);
 	start_scan();
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60)); /* #8: arm idle heartbeat */
