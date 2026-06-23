@@ -49,6 +49,15 @@
 > `~/zmk-logs` go dark). So: merge the code; do NOT "remove logging" on-device. After the merge, `canon@main` carries v3.1
 > → future builds need NO local-injection hack.
 >
+> **✅ KVM/power prong VERIFIED (2026-06-23 PM) — the self-powered USB hub fixes the switch-reboot.** The Elecom hub arrived;
+> inserted between the monitor/KVM and the dongle to hold VBUS across a KVM switch. **4/4 KVM switches → 0 dongle reboots**
+> (device uptime stayed continuous, e.g. 480→720 s with no reset; no new `Booting Zephyr`; BLE link held — no zombie/bounce;
+> `rx_notif` kept climbing through each switch; owner: "マウス異常なし"). Contrast: pre-hub, every KVM switch cut VBUS →
+> `Booting Zephyr` → post-boot zombie → freeze (3 such external reboots in the hour before the hub). **The dongle reboots on a
+> VBUS drop, NOT a double-tap** — the hub keeps VBUS up, so it never reboots, so there is no post-boot zombie.
+> **Net: both #8 freeze sources are now addressed** — v3.1 firmware (self-heals idle-recovery zombies) + the hub hardware
+> (prevents the KVM-switch reboot, which was the dominant remaining cause).
+>
 > <details><summary>Deferred review findings (not in v3.1 — known, lower priority)</summary>
 >
 > - `report_work_handler` consumer-side stale-layout race (epoch-tag `report_evt`) — pre-existing, low; exercised more by the bounce flow.
