@@ -1,6 +1,35 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # 🧪 v3.4 LIVE CCC RE-SUBSCRIBE — BUILT, awaiting flash + SOAK (2026-06-23 night). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> # ❌→✅ v3.4 LIVE CCC RE-SUBSCRIBE TRIED ON-DEVICE → FAILED → REVERTED to v3.3 (2026-06-23 night). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> **Negative result (conclusive). The cure for the post-reconnect silence REQUIRES the link-layer disconnect (the bounce);
+> no GATT-layer CCC operation re-starts this IST PRO's notifications.** v3.4 tried to cure the silence (link up + subscribed but
+> 0 notifications for ~4 s) WITHOUT the bounce, by re-writing the peer's CCC (notify-enable) over-air on the live link. On-device:
+> - **v3.4 (bare `0x0001` re-write):** kicked all 5 handles cleanly, rx stayed 0 → bounce. No-op, because the reconnect's own
+>   `bt_gatt_subscribe` already wrote `0x0001` (re-writing the same value re-triggers nothing).
+> - **v3.4.1 (forced `0x0000`→`0x0001` EDGE):** **3/3 episodes** (23:46:59 / 23:47:16 / 23:49:16) — all 10 writes ACKed with NO
+>   error, yet rx stayed 0 every time → bounce. Consistent and conclusive.
+>
+> **So the silence is NOT a CCC-config problem.** (unsubscribe+subscribe would be the same over-air `0->1` → same result.) The
+> `bt_gatt_subscribe`-already-wrote-the-CCC fact + the 3/3 edge failure mean the peer's notification engine is not gated on the CCC
+> value on the live link; only a real disconnect/reconnect restarts it. **The freeze cannot be cured below the bounce cost for this
+> peer via any GATT trick.**
+>
+> **The guarded design worked perfectly:** every failed kick fell back to the proven bounce (zero harm — no new zombies, no hang),
+> so this was a clean conclusive experiment. But while enabled it added ~2 s (kick + 2 s verify window) before the curative bounce,
+> making the freeze WORSE — so it was **reverted** (commit `7947cd0`; policy/header/tests byte-identical to v3.3, boot marker
+> `v3.4.2 resub-removed`). Logging uf2 of the revert: built (sha recorded at flash). **On-device = back to the v3.3 immediate-bounce
+> ladder** (the ~4–7 s freeze is the floor for this mouse).
+>
+> **What's actually left to try (separate, FUTURE — not done):** the silence is **binary** (a healthy reconnect streams rx 103–267
+> in 2 s; a silent one is literally 0 — no middle ramp). So a **SHORTER detection window** could fire the curative bounce sooner =
+> shorter freeze, where v3.4 wrongly assumed the cure could skip the bounce. This was deferred as risky on 2 s-granularity logs, but
+> the binary finding makes it more promising. Method: first instrument sub-2 s rx checkpoints (log rx at 1.0 s / 1.5 s) to learn how
+> fast a healthy reconnect crosses ~100, then adopt a 1 s window + proportional threshold only if it cleanly separates healthy from
+> silent. Until then v3.3's 2 s window stays.
+>
+> _The v3.4 design banner below is kept as the experiment record (mechanism + Zephyr-API rationale); it is DONE/REVERTED, not pending._
+
+> # 🧪 v3.4 LIVE CCC RE-SUBSCRIBE — design record (TRIED → FAILED → REVERTED; see banner above). branch `feat/zombie-auto-recover`.
 > **The real latency win, as a guarded experiment.** v3.3 (below) confirmed the freeze is a post-reconnect SILENCE cured only by
 > the bounce. v3.4 tries to cure it WITHOUT the bounce's disconnect+reconnect cost (most of the 4–7 s freeze): on zombie-detect,
 > **re-write each report's CCC (notify-enable, `0x0001`) over-air on the LIVE link** (`bt_gatt_write`), then re-arm a verify window —
