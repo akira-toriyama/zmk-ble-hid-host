@@ -41,8 +41,13 @@
 > → bounce 2 (5 s deaf ✓) → `zombie-check OK rx+223`, **no self-reboot** ✓. Then stable `conn=1 sub=5 rec=0 att=0 reboots=0 lat=44`.
 >
 > **Status:** logging variant on the dongle; **monitoring active** (session cron `4dd74404`, 30 min, reports only anomalies).
-> **NOT pushed/merged at commit time → owner later said push OK** (see latest commits). Next = OBSERVE real (non-boot) zombies
-> over normal use → if good, build a **prod (non-logging)** variant + un-draft/merge.
+> **Pushed + folded into PR #15** (feat fast-forwarded to the v3.1 commits; standalone `fix/8-recovery-disruption` branch
+> deleted, commits preserved on feat). Next = OBSERVE real (non-boot) zombies over normal use.
+> **Agreed endgame (owner, 2026-06-23) = "Plan A":** if observation is good → **un-draft PR #15 + merge to `main`**, but
+> **KEEP running the LOGGING variant in daily use** (the dongle is USB-powered → logging has no battery cost and preserves
+> the 24/7 `~/zmk-logs` monitorability for #8/#12). **Do NOT switch to a non-logging/prod build** (that would make
+> `~/zmk-logs` go dark). So: merge the code; do NOT "remove logging" on-device. After the merge, `canon@main` carries v3.1
+> → future builds need NO local-injection hack.
 >
 > <details><summary>Deferred review findings (not in v3.1 — known, lower priority)</summary>
 >
