@@ -16,7 +16,10 @@ static int failures;
         }                                                                                          \
     } while (0)
 
-/* Baseline healthy-mid-session context; tests override the fields they exercise. */
+/* Baseline healthy-mid-session context; tests override the fields they exercise.
+ * Re-arm is DISABLED here (rearm_max = 0 == v3.1 behaviour) so the existing
+ * bounce/reboot-ladder tests below exercise the same rungs as before; the
+ * re-arm tests opt in explicitly with rearm_max = 1. */
 static struct zr_ctx base(void) {
     struct zr_ctx c = {
         .rx_delta = 0, .rx_min = 100,
@@ -24,6 +27,7 @@ static struct zr_ctx base(void) {
         .uptime_ms = 600000, .reboot_min_uptime_ms = 60000,
         .reboot_count = 0, .reboot_budget = 2,
         .healthy_since_boot = true,
+        .rearms_used = 0, .rearm_max = 0,
     };
     return c;
 }
@@ -72,6 +76,35 @@ int main(void) {
     { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 3; CHECK(zr_decide(&c) == ZR_REBOOT); }
     { struct zr_ctx c = base(); c.rx_delta = 0; c.bounce_attempts = 3; c.healthy_since_boot = false;
       CHECK(zr_decide(&c) == ZR_GIVE_UP); }
+
+    /* --- #8 idle false-positive fix: bounded re-arm (debounce) before any bounce ---
+     * On the first sub-threshold detection of an episode, re-arm one more window
+     * (no disconnect) instead of bouncing. The IST PRO reconnects but the user may
+     * not have moved yet -> rx+0 in the first 2s window -> a healthy link gets
+     * bounced (the felt freeze). Re-arming lets the user's motion arrive and cancel
+     * the false bounce. A genuine zombie stays silent across the re-arm -> still bounces. */
+
+    /* fresh idle zombie (rx+0), re-arm budget available -> REARM, NOT a bounce */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.rearm_max = 1; c.rearms_used = 0;
+      CHECK(zr_decide(&c) == ZR_REARM); }
+    /* fresh just-under-threshold zombie (rx+88, flowing-but-low), re-arm available -> REARM */
+    { struct zr_ctx c = base(); c.rx_delta = 88; c.rearm_max = 1; c.rearms_used = 0;
+      CHECK(zr_decide(&c) == ZR_REARM); }
+
+    /* K=1 boundary: the one re-arm is spent and the link is still silent -> fall through
+     * to the existing bounce ladder (re-arm does not loop forever on a real zombie) */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.rearm_max = 1; c.rearms_used = 1;
+      c.bounce_attempts = 0; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
+
+    /* precedence: a link that started FLOWING during the re-arm window recovers (OK_RESET);
+     * re-arm must never preempt a recovered link */
+    { struct zr_ctx c = base(); c.rx_delta = 250; c.rearm_max = 1; c.rearms_used = 0;
+      CHECK(zr_decide(&c) == ZR_OK_RESET); }
+
+    /* rearm_max = 0 disables the debounce entirely == exact v3.1 behaviour (no regression):
+     * a fresh sub-threshold zombie goes straight to a bounce */
+    { struct zr_ctx c = base(); c.rx_delta = 0; c.rearm_max = 0; c.rearms_used = 0;
+      c.bounce_attempts = 0; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
 
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("all policy tests passed\n");
