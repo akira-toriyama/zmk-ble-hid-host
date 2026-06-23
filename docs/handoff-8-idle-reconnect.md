@@ -1,6 +1,60 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # ✅ v3 SHIPPED TO DEVICE + PUSHED (2026-06-23) — code DONE + FLASHED + on PR #15; next = OBSERVE real zombies. READ THIS FIRST.
+> # ✅ v3.1 FREEZE-FIX SHIPPED TO DEVICE (2026-06-23 PM) — READ THIS FIRST. branch `fix/8-recovery-disruption`, FLASHED + monitoring.
+> **Why:** after v3 was flashed, the owner reported **"mouse freezes increased."** Field logs (`~/zmk-logs/zmk-2026-06-23.log`,
+> v3 running) confirmed it was **NOT a new bug** but v3's recovery being **more disruptive than v2**, applied to the same
+> genuine zombies (rx+0 dominant — 16/20 ZOMBIE lines were `rx+0<100`, i.e. real "connected+subscribed but zero flow",
+> NOT the idle-burst false-positive):
+> - **every bounce imposed a 5 s deaf window** (v2 re-scanned immediately) — frequency main cause (18 bounces that day);
+> - **the self-reboot rung fired** (USB re-enumeration) — smoking gun at 13:56: armed `recovering=1 att=2` → 2 s later the
+>   capture detached → `Booting Zephyr` + USB re-enum → `zombie-check OK rx+197`. The `self-reboot now` WRN line was
+>   swallowed by the capture gap, but the boot-after-exhausted-bounces sequence + sha proves it. USB re-enum is the worst
+>   interruption on the owner's KVM/USB-hub setup (the very thing the hardware-hub prong exists to avoid).
+>
+> **Owner-chosen direction (reliability vs disruption):** deaf window → **1st bounce re-scans IMMEDIATELY** (most zombies
+> clear on one bounce), only the 2nd+ bounce delays; self-reboot → **kept as last resort but RATE-LIMITED by a budget**.
+>
+> **What v3.1 does (branch `fix/8-recovery-disruption`, commit `1403127`, off `feat/zombie-auto-recover`):**
+> - **1st-bounce-immediate**: `disconnected()` re-scans immediately when `zr_attempts<2`, delays `ZR_BOUNCE_DELAY_MS` only for the 2nd+.
+> - **Reboot budget** (`ZR_REBOOT_BUDGET`=2): `zr_decide` gates `ZR_REBOOT` on `reboot_count < budget` too; `zr_reboot_count`
+>   is `__noinit` (retained across warm reboot), incremented before `sys_reboot`, refilled in the heartbeat after a sustained
+>   healthy session (`ZR_REBOOT_STREAK_RESET_MS`=5 min), magic-validated at startup. **Fail-safe**: if RAM isn't retained the
+>   count reads 0 → budget never bites → == prior behaviour, never worse.
+> - **Correctness fixes from the v3 multi-agent review** (21 confirmed findings; the cluster the critic prioritised):
+>   (a) `disconnected()` `k_work_cancel_delayable(&zombie_check_work)` so a stale check can't fire against the NEXT connection
+>   mid-discovery and bounce a healthy reconnect (this stale-fire was **observed in the 06-22 logs**);
+>   (b) recovery state (`zr_recovering`/`zr_attempts`/`zr_delay_rescan`) torn down on any non-bounce disconnect + a
+>   reconnect-gap freshness check, so a stranded episode can't carry a stale attempt count into the next reconnect and skip
+>   rungs to a reboot;
+>   (c) `zombie_check_handler` holds a `bt_conn_ref` across the handler + checks the `bt_conn_disconnect()` return (no UAF / no stranded state).
+> - **Observability/hygiene**: heartbeat now logs `rec/att/reboots` (so the post-bounce window / recovery-in-progress isn't
+>   mis-read as idle-death); removed the spent `ADV-seen` scan diagnostic; the `ZR_MIN_RX`/window comment now states the
+>   real `burst+flow>=100` invariant + its known idle-reconnect false-positive.
+>
+> **Verification:** host policy tests green (`-Werror`; new RED→GREEN budget gate + precedence/boundary/attempts>max);
+> **firmware compile + logic adversarially reviewed** by subagents → `WILL_COMPILE` + `SAFE_TO_FLASH` (2 nits applied:
+> unref before reboot; soften the ref comment). Built via canon harness with the **local fix injected over the WS module**
+> (canon pulls `zmk-ble-hid-host@main` which lacks v3, so the local branch was rsync'd over `~/.cache/zmk-canon/cfgrepo/zmk-ble-hid-host`
+> and built with west-update SKIPPED). **Flashed (logging variant) sha256 `e1c708a66212b9f1169445b208912f4818d54e83cb77478a503177a0d015d676`.**
+>
+> **Live validation (flash-induced boot incident, 16:08):** post-boot zombie → bounce 1 (re-scan **gap=2 s = immediate** ✓)
+> → bounce 2 (5 s deaf ✓) → `zombie-check OK rx+223`, **no self-reboot** ✓. Then stable `conn=1 sub=5 rec=0 att=0 reboots=0 lat=44`.
+>
+> **Status:** logging variant on the dongle; **monitoring active** (session cron `4dd74404`, 30 min, reports only anomalies).
+> **NOT pushed/merged at commit time → owner later said push OK** (see latest commits). Next = OBSERVE real (non-boot) zombies
+> over normal use → if good, build a **prod (non-logging)** variant + un-draft/merge.
+>
+> <details><summary>Deferred review findings (not in v3.1 — known, lower priority)</summary>
+>
+> - `report_work_handler` consumer-side stale-layout race (epoch-tag `report_evt`) — pre-existing, low; exercised more by the bounce flow.
+> - Tunables still `#define`, not Kconfig — promote for field tuning without a logic rebuild (low).
+> - zombie-check armed ONLY at discovery-done: a reconnect that secures but whose **discovery fails** is never armed
+>   (connected-but-unvalidated) — pre-existing, NOT the freeze cause; the cancel-on-disconnect doesn't worsen it.
+> - Detector calibration (idle-reconnect false-positive): cost now bounded (1st bounce immediate, reboot budgeted); a true
+>   burst-vs-flow discriminator (v3-live) would remove it but needs on-device validation.
+> </details>
+
+> # ✅ v3 SHIPPED TO DEVICE + PUSHED (2026-06-23) — code DONE + FLASHED + on PR #15; next = OBSERVE real zombies. (v3.1 freeze-fix above supersedes for "read first".)
 > The escalation ladder (delayed bounce → `sys_reboot`, with loop guards) is implemented, host-tested, Docker-built,
 > reviewed clean, **flashed to the dongle (logging variant, sha-verified), and pushed to PR #15 (draft) + issue #8**.
 > Remaining = the on-device OBSERVATION phase (does v3 auto-recover a real zombie). Merge to `main` still gated on the
