@@ -17,8 +17,13 @@
 > **The guarded design worked perfectly:** every failed kick fell back to the proven bounce (zero harm — no new zombies, no hang),
 > so this was a clean conclusive experiment. But while enabled it added ~2 s (kick + 2 s verify window) before the curative bounce,
 > making the freeze WORSE — so it was **reverted** (commit `7947cd0`; policy/header/tests byte-identical to v3.3, boot marker
-> `v3.4.2 resub-removed`). Logging uf2 of the revert: built (sha recorded at flash). **On-device = back to the v3.3 immediate-bounce
-> ladder** (the ~4–7 s freeze is the floor for this mouse).
+> `v3.4.2 resub-removed`).
+>
+> ⚠️ **PENDING / RESUME HERE:** the revert **v3.4.2 is BUILT but NOT yet flashed** — uf2 sha256
+> `9a42dadf46682f7c9a4ab4d1ff10b5f5d1d685abd5c5e19c9eef66616cdd90ef`. **The device still runs v3.4.1** (the ~2 s-penalty variant)
+> until v3.4.2 is flashed. To check: the HB / boot marker says `v3.4.1` if not yet flashed, `v3.4.2 resub-removed` once flashed.
+> **Next session step 1 = flash v3.4.2** (`bash ~/bin/flash-ist-logging.sh`, owner double-taps) to drop the penalty → device back on
+> the v3.3 immediate-bounce ladder (the ~4–7 s freeze is the floor for this mouse). Branch `feat/zombie-auto-recover`, PR #15 (draft, NOT merged).
 >
 > **What's actually left to try (separate, FUTURE — not done):** the silence is **binary** (a healthy reconnect streams rx 103–267
 > in 2 s; a silent one is literally 0 — no middle ramp). So a **SHORTER detection window** could fire the curative bounce sooner =
