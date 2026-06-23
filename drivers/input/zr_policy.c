@@ -11,14 +11,6 @@ enum zr_action zr_decide(const struct zr_ctx *c)
     if (c->rx_delta >= c->rx_min) {
         return ZR_OK_RESET; /* flowing */
     }
-    if (c->rearms_used < c->rearm_max) {
-        /* Debounce before any disconnect: a healthy link whose user just hasn't
-         * moved yet (or whose first window caught only the post-reconnect flush
-         * burst) reads sub-threshold too. Re-arm one more window instead of
-         * bouncing it -- motion in the next window cancels the false bounce. A
-         * genuine zombie stays silent across the re-arm and falls through. */
-        return ZR_REARM;
-    }
     if (c->bounce_attempts < c->bounce_max) {
         return ZR_DELAYED_BOUNCE; /* still have light retries */
     }
