@@ -226,9 +226,13 @@ static void zombie_check_handler(struct k_work *work)
 		bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		return;
 	case ZR_REBOOT:
-		LOG_WRN("ZOMBIE persists after %u bounces (up=%us, healthy_since_boot=1) -> self-reboot now",
-			zr_attempts, k_uptime_get_32() / 1000U);
-		k_msleep(50);          /* let the log line flush over USB-CDC before reset */
+		LOG_WRN("ZOMBIE persists after %u bounces (up=%us, healthy_since_boot=%d) -> self-reboot now",
+			zr_attempts, k_uptime_get_32() / 1000U, zr_healthy_since_boot ? 1 : 0);
+		/* This handler runs on the system workqueue, so this 50 ms sleep briefly
+		 * stalls other delayable work -- intentional: sys_reboot() below is the
+		 * last thing this queue ever does. The sleep lets the log line flush over
+		 * USB-CDC before the reset. */
+		k_msleep(50);
 		sys_reboot(SYS_REBOOT_WARM);
 		return;                /* unreachable */
 	case ZR_GIVE_UP:
