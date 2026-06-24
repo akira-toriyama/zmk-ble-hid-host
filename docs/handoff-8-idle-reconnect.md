@@ -1,6 +1,34 @@
 # Handoff — #8 idle-recovery (mouse sleeps → dongle won't recover)
 
-> # 🧪 v3.5 SUB-2s rx PROBE — instrumentation BUILT (logging-only, NOT yet flashed) (2026-06-24). branch `feat/zombie-auto-recover`. READ THIS FIRST (supersedes the v3.4 banner below as the current state).
+> # ✅ v3.6 FAST-DETECT — FLASHED + LIVE (2026-06-24 09:36). branch `feat/zombie-auto-recover`. READ THIS FIRST.
+> **The freeze got ~1 s shorter. Detection window 2000 → 1000 ms; threshold HELD at 100 (NOT lowered).** v3.5's probe proved a
+> healthy reconnect clears 100 within ~1 s (it hits ~134 by 1000 ms), so the curative bounce can fire a full second sooner —
+> shaving ~1 s off the ~3–4 s freeze on the dominant silent-zombie class. Confirmed live: a fresh-boot healthy episode logged
+> `@250ms rx+33 · @500ms rx+66 · @750ms rx+101 · zombie-check OK rx+134 in 1s`; boot marker `v3.6 fast-detect: window=1000 thr=100
+> (burst-ceiling count)`; mouse works. Logging uf2 sha256 `9fb98435ff9bf913934bafee261836f13b35ee87a5a3da9b630cf53b312f31c1`.
+>
+> ⚠️ **HARD-WON LESSON (an adversarial review caught this before flashing — do NOT relearn it the hard way):** the FIRST v3.6 draft
+> ALSO halved the threshold 100 → 50 ("preserve 50 rx/s sensitivity"). **That was wrong and would have shipped a freeze bug.**
+> `zr_decide()` compares a cumulative COUNT, not a rate, and `ZR_MIN_RX` is doing double duty: it is also the **post-reconnect
+> flush-burst CEILING.** A zombie is not always rx=0 — it can emit a one-shot burst then stall (field `~/zmk-logs`: 24/97 ZOMBIE
+> bounces had nonzero rx, max 97; e.g. 09:11 `+58` burst-then-stall, 16:31 `+89` boot burst). The old 100 bar sits ABOVE that 97
+> ceiling so those are correctly bounced; a 50 bar declares them HEALTHY → frozen cursor + a false `healthy_since_boot` that
+> corrupts the reboot guard. **So: shorten the WINDOW for latency, but the THRESHOLD only moves UP (toward a higher observed burst
+> ceiling), never down.** A host policy boundary test now regression-locks it (rx_delta 97/99 → bounce, 100 → OK).
+>
+> **What's verified safe (same review):** window 1000 ms, the episode-freshness gate (10000 → 9000 ms — still > the ~5970 ms max
+> real bounce-reconnect gap), faster escalation cadence (reboot gates are all wall-clock/counter based, window-independent), and the
+> probe retarget {250,500,750} ms (all < 1 s). Net behaviour change = exactly: detect 1 s sooner. Burst protection == shipping.
+>
+> **Next = SOAK.** The one residual risk of 1 s/100 is a healthy reconnect that is moving SLOWLY and lands < 100 at 1 s (the old
+> 2 s/100 gave it more time) → an unnecessary (but cheap, immediate-rescan) bounce. The retained probe {250,500,750} is exactly the
+> watch for this: scan `~/zmk-logs` for a `zombie-probe @750ms rx+NN` with NN in ~60–99 immediately followed by a `ZOMBIE … bounce`
+> — if that recurs, the 1 s window is too tight for slow movers (widen to ~1200–1500 ms, keep thr 100). Also confirm burst-stall
+> zombies (rx 1–99 then stall) are still bounced. If clean after days → prod (non-logging) + un-draft PR #15 + merge.
+>
+> _The v3.5 banner below (probe instrumentation, the measurement that justified this window) remains the rationale for v3.6._
+
+> # 🧪 v3.5 SUB-2s rx PROBE — instrumentation FLASHED + LIVE (2026-06-24). branch `feat/zombie-auto-recover`. (Superseded as current state by the v3.6 banner above.)
 > **The disciplined next step after v3.4's negative result: LEARN the curve before shortening the window.** v3.4 proved the
 > post-reconnect silence cannot be cured below the bounce cost (no GATT trick restarts notifications). The only remaining latency
 > win is firing the curative bounce SOONER — but this handoff explicitly forbids blindly dropping the 2 s window (2 s-granularity

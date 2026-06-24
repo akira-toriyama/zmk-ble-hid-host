@@ -168,21 +168,25 @@ static uint16_t cur_latency = 0xFFFF;
  *   4. ZR_GIVE_UP: reboot guard not met (too early, never healthy, or budget spent) -> stop.
  *
  * INF logging only (NO verbose BT DBG, which breaks BLE timing). */
-#define ZR_WINDOW_MS  2000U   /* detection window. Data (~/zmk-logs, measured at the 10 s window):
-				* healthy reconnects added 246-598 rx in 10 s; zombies added 0 or ~88
-				* (the post-reconnect flush burst, lands <1 s). */
-#define ZR_MIN_RX     100U    /* < this many notifications in the window == zombie.
-				* HONEST INVARIANT (the real bar, not "burst+12"): a healthy reconnect
-				* passes only if burst + post-burst flow >= 100 within the 2 s window. A
-				* HID mouse emits notifications only on motion/buttons, so a healthy but
-				* IDLE reconnect (user not moving in those 2 s) delivers burst-only
-				* (~30-88, logs vary) < 100 and is FALSE-flagged as a zombie. This
-				* false-positive is tolerated because its cost is now bounded: the 1st
-				* bounce re-scans immediately (no deaf window) and the reboot rung is
-				* budget-limited. A burst-vs-flow discriminator (v3-live) would remove it
-				* but needs on-device validation. Watch ZOMBIE rx+NN<100 with NN in 30-99
-				* immediately followed by healthy: if frequent, this threshold/window need
-				* re-tuning. */
+#define ZR_WINDOW_MS  1000U   /* v3.6 detection window (was 2000). ONLY the window shortens; the threshold
+				* (ZR_MIN_RX) stays 100. Shorter window => fire the curative bounce ~1 s sooner
+				* (= ~1 s shorter freeze). 1000 ms is the EARLIEST safe point per the v3.5 probe
+				* (~/zmk-logs): a healthy reconnect reaches ~134 by 1 s (clears 100), while a
+				* zombie's one-shot flush burst (lands <1 s, observed max 97) does NOT -- so the
+				* 100 bar still separates them at 1 s. Shorter (e.g. 500 ms) is unsafe: a healthy
+				* reconnect is only ~66 there, below 100. Cosmetic "/1000U" log divisions read "1s". */
+#define ZR_MIN_RX     100U    /* < this many notifications in the window == zombie. UNCHANGED across v3.6 ON
+				* PURPOSE: this bar is NOT a rate floor, it is the post-reconnect FLUSH-BURST
+				* ceiling. zr_decide() compares a cumulative COUNT, and a zombie can emit a one-shot
+				* burst then stall (field ~/zmk-logs: ZOMBIE rx ran 1..97 nonzero; 09:11 = +58
+				* burst-then-stall, 16:31 = +89 boot burst). 100 sits above the observed 97 ceiling,
+				* so those bursts are still bounced. Halving it to 50 (tried in a draft, REVERTED)
+				* declared +58/+89 bursts HEALTHY => frozen cursor + a false healthy_since_boot that
+				* corrupts the reboot guard. A healthy-but-IDLE reconnect (user not moving) delivers
+				* burst-only < 100 and is still FALSE-flagged a zombie -- tolerated, cost bounded
+				* (1st bounce re-scans immediately; reboot rung budget-limited). Watch ZOMBIE rx+NN
+				* with NN in 90-99 followed by healthy: if frequent, the burst ceiling has risen and
+				* this needs re-tuning (raise the threshold, do NOT lower it). */
 #define ZR_BOUNCE_MAX            2U      /* bounces before escalating to reboot */
 #define ZR_BOUNCE_DELAY_MS       5000U   /* re-scan delay AFTER the 2nd+ bounce (peer reset); the 1st
 					 * bounce re-scans immediately -- see disconnected() */
@@ -285,21 +289,20 @@ static void zombie_check_handler(struct k_work *work)
 }
 static K_WORK_DELAYABLE_DEFINE(zombie_check_work, zombie_check_handler);
 
-/* #8 v3.5 latency-R&D instrumentation (LOGGING-ONLY — no behaviour change; zr_decide()
- * and the recovery ladder are untouched). The post-reconnect silence is BINARY (a
- * healthy reconnect streams rx ~103-267 within ZR_WINDOW_MS; a silent one stays at
- * literally 0 — no middle ramp) and is cured only by the bounce. The full-window check
- * at ZR_WINDOW_MS already decides correctly; the open question is *how early* a healthy
- * reconnect crosses ZR_MIN_RX, because if it crosses well before ZR_WINDOW_MS then a
- * SHORTER detection window could fire the curative bounce sooner = shorter freeze. To
- * learn that crossing curve from the field (~/zmk-logs) we log the rx delta at sub-window
- * checkpoints WITHOUT touching the decision (still taken at ZR_WINDOW_MS by
- * zombie_check_work). A few cheap INF lines per episode on the system workqueue (NOT the
- * GATT notify path) -> no BLE-timing impact. Armed/cancelled in lockstep with
- * zombie_check_work. Once the curve is known, decide whether a 1 s window + proportional
- * threshold cleanly separates healthy from silent; until then ZR_WINDOW_MS / ZR_MIN_RX
- * stay exactly as v3.3. */
-static const uint16_t zr_probe_ms[] = { 500U, 1000U, 1500U }; /* strictly < ZR_WINDOW_MS, ascending */
+/* #8 v3.5/v3.6 latency-R&D instrumentation (LOGGING-ONLY — no behaviour change; zr_decide()
+ * and the recovery ladder are untouched). A post-reconnect zombie is cured only by the bounce.
+ * Most zombies are SILENT (rx stays at 0), but some emit a one-shot flush burst (field max 97)
+ * then stall — so the discriminator is the ZR_MIN_RX(=100) burst-ceiling, NOT zero. v3.5's
+ * checkpoints {500,1000,1500} ms showed a healthy reconnect clears 100 by ~1 s (~134) while
+ * silent/burst-stall zombies (<=97) do not, which JUSTIFIED v3.6 shortening ZR_WINDOW_MS to
+ * 1000 ms (threshold kept at 100). We KEEP the probe under the 1 s window — now at
+ * {250,500,750} ms — to (a) keep validating that the 1 s decision agrees with what 2 s would
+ * have said, especially that no healthy reconnect lands just under 100 at 1 s, and (b)
+ * characterise whether an even shorter window is ever safe. The probe logs the rx delta WITHOUT
+ * touching the decision (still taken at ZR_WINDOW_MS by zombie_check_work). A few cheap INF
+ * lines per episode on the system workqueue (NOT the GATT notify path) -> no BLE-timing impact.
+ * Armed/cancelled in lockstep with zombie_check_work. */
+static const uint16_t zr_probe_ms[] = { 250U, 500U, 750U }; /* strictly < ZR_WINDOW_MS, ascending */
 static uint8_t zr_probe_idx; /* next checkpoint index to log; reset to 0 when armed */
 
 static void zr_probe_handler(struct k_work *work);
@@ -1172,8 +1175,9 @@ static void start_work_handler(struct k_work *work)
 		zr_persist_magic = ZR_PERSIST_MAGIC;
 		zr_reboot_count = 0;
 	}
-	LOG_INF("ble_hid_host up (v3.5 probe=v3.3 bounce + sub-2s rx checkpoints: 1st-bounce-immediate, "
+	LOG_INF("ble_hid_host up (v3.6 fast-detect: window=%ums thr=%u (burst-ceiling count), 1st-bounce-immediate, "
 		"bounce_max=%u delay=%ums reboot_gate=%us budget=%u/%u)",
+		ZR_WINDOW_MS, ZR_MIN_RX,
 		ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U,
 		zr_reboot_count, ZR_REBOOT_BUDGET);
 	start_scan();

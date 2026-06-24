@@ -33,6 +33,13 @@ int main(void) {
     { struct zr_ctx c = base(); c.rx_delta = 250; CHECK(zr_decide(&c) == ZR_OK_RESET); }
     { struct zr_ctx c = base(); c.rx_delta = 100; CHECK(zr_decide(&c) == ZR_OK_RESET); }
 
+    /* #8 v3.6 burst-ceiling boundary (regression-lock the deployed ZR_MIN_RX=100): a zombie's
+     * one-shot post-reconnect flush burst (field max observed 97) must stay BELOW the bar so it
+     * is bounced, NOT declared healthy. 97/99 < 100 -> zombie; 100 >= 100 -> healthy. Lowering
+     * the threshold to 50 (tried, reverted) declared +58/+89 bursts healthy = frozen cursor. */
+    { struct zr_ctx c = base(); c.rx_delta = 97; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
+    { struct zr_ctx c = base(); c.rx_delta = 99; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
+
     /* zombie, attempts left -> DELAYED_BOUNCE */
     { struct zr_ctx c = base(); c.rx_delta = 88; c.bounce_attempts = 0; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
     { struct zr_ctx c = base(); c.rx_delta = 0;  c.bounce_attempts = 1; CHECK(zr_decide(&c) == ZR_DELAYED_BOUNCE); }
