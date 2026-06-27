@@ -44,6 +44,8 @@ LOG_MODULE_DECLARE(ble_hid_host, CONFIG_ZMK_BLE_HID_HOST_LOG_LEVEL);
 #include <zephyr/bluetooth/hci.h>
 
 #include <zmk_ble_hid_host/hid_report_parser.h>
+#include <zmk_ble_hid_host/zr_policy.h>
+#include <zephyr/sys/reboot.h>
 
 #define MAX_REPORTS 12
 #define APPEARANCE_MOUSE 0x03C2
@@ -136,6 +138,197 @@ struct report_evt {
 K_MSGQ_DEFINE(report_msgq, sizeof(struct report_evt), 16, 4);
 static struct k_work report_work;
 
+/* #8 diag counters (NEVER reset — monotonic; deltas across HB/disconnect lines are
+ * the signal): rx_notif = GATT notifications received in notify_cb; pub_reports =
+ * reports actually forwarded to USB. Surfaced in the heartbeat + disconnect lines so
+ * a ZOMBIE reconnect (conn up, subscribed, but no report flow) is visible at INF. */
+static uint32_t rx_notif;
+static uint32_t pub_reports;
+/* #8 diag: last negotiated peripheral latency (0xFFFF = not connected). v2 REMOVED the
+ * latency-0 clamp, so this now just OBSERVES the peer's real latency (expect ~44) -- a
+ * baseline to compare zombie frequency against the old clamped-to-0 era. */
+static uint16_t cur_latency = 0xFFFF;
+
+/* #8 auto-recover (path #2): the zombie (reconnect succeeds + an initial burst of
+ * reports arrives, then rx_notif goes flat while the LL link stays up) is cured by a
+ * fresh reconnect -- owner-confirmed 2026-06-22: a DONGLE re-plug revives it with NO
+ * mouse power-cycle. So detect it and force a fresh reconnect ourselves. Detection arms
+ * on EVERY reconnect: the zombie is PROBABILISTIC, not duration-gated.
+ * Reconnect storms are safe: each reconnect k_work_reschedule()s the single check, so only
+ * the post-storm check fires (no bounce spam).
+ *
+ * v3 escalation ladder (zr_decide()):
+ *   1. ZR_OK: healthy (rx_delta >= ZR_MIN_RX) -> mark healthy_since_boot, reset state.
+ *   2. ZR_DELAYED_BOUNCE: zombie detected, bounces < ZR_BOUNCE_MAX -> bt_conn_disconnect.
+ *      The 1st bounce re-scans IMMEDIATELY (most zombies clear on one bounce); the 2nd+
+ *      bounce delays the re-scan by ZR_BOUNCE_DELAY_MS so a stubborn peer fully resets.
+ *   3. ZR_REBOOT: zombie persists after ZR_BOUNCE_MAX bounces AND the link was healthy at
+ *      least once this boot AND uptime >= ZR_REBOOT_MIN_UPTIME_MS AND the reboot budget is
+ *      not spent -> sys_reboot(SYS_REBOOT_WARM) last resort (bond in NVS; auto-reconnects).
+ *   4. ZR_GIVE_UP: reboot guard not met (too early, never healthy, or budget spent) -> stop.
+ *
+ * INF logging only (NO verbose BT DBG, which breaks BLE timing). */
+#define ZR_WINDOW_MS  1000U   /* v3.6 detection window (was 2000). ONLY the window shortens; the threshold
+				* (ZR_MIN_RX) stays 100. Shorter window => fire the curative bounce ~1 s sooner
+				* (= ~1 s shorter freeze). 1000 ms is the EARLIEST safe point per the v3.5 probe
+				* (~/zmk-logs): a healthy reconnect reaches ~134 by 1 s (clears 100), while a
+				* zombie's one-shot flush burst (lands <1 s, observed max 97) does NOT -- so the
+				* 100 bar still separates them at 1 s. Shorter (e.g. 500 ms) is unsafe: a healthy
+				* reconnect is only ~66 there, below 100. Cosmetic "/1000U" log divisions read "1s". */
+#define ZR_MIN_RX     100U    /* < this many notifications in the window == zombie. UNCHANGED across v3.6 ON
+				* PURPOSE: this bar is NOT a rate floor, it is the post-reconnect FLUSH-BURST
+				* ceiling. zr_decide() compares a cumulative COUNT, and a zombie can emit a one-shot
+				* burst then stall (field ~/zmk-logs: ZOMBIE rx ran 1..97 nonzero; 09:11 = +58
+				* burst-then-stall, 16:31 = +89 boot burst). 100 sits above the observed 97 ceiling,
+				* so those bursts are still bounced. Halving it to 50 (tried in a draft, REVERTED)
+				* declared +58/+89 bursts HEALTHY => frozen cursor + a false healthy_since_boot that
+				* corrupts the reboot guard. A healthy-but-IDLE reconnect (user not moving) delivers
+				* burst-only < 100 and is still FALSE-flagged a zombie -- tolerated, cost bounded
+				* (1st bounce re-scans immediately; reboot rung budget-limited). Watch ZOMBIE rx+NN
+				* with NN in 90-99 followed by healthy: if frequent, the burst ceiling has risen and
+				* this needs re-tuning (raise the threshold, do NOT lower it). */
+#define ZR_BOUNCE_MAX            2U      /* bounces before escalating to reboot */
+#define ZR_BOUNCE_DELAY_MS       5000U   /* re-scan delay AFTER the 2nd+ bounce (peer reset); the 1st
+					 * bounce re-scans immediately -- see disconnected() */
+#define ZR_REBOOT_MIN_UPTIME_MS  60000U  /* don't self-reboot within this uptime (post-boot loop guard) */
+#define ZR_REBOOT_BUDGET         2U      /* max self-reboots (USB re-enumerations) per bad streak before
+					 * GIVE_UP -- a chronic peer degrades to manual recovery, not a
+					 * reboot cycle. Retained across warm reboots (zr_reboot_count). */
+#define ZR_REBOOT_STREAK_RESET_MS 300000U /* a healthy session this long refills the reboot budget, so an
+					   * isolated zombie hours later can still reboot once */
+/* Retained self-reboot budget: zr_reboot_count must survive a warm sys_reboot() to cap consecutive
+ * USB re-enumerations, so it lives in __noinit RAM (not zeroed by C startup; retained across
+ * SYS_REBOOT_WARM on nRF52). FAIL-SAFE: if a bootloader ever clears this RAM the count reads 0 ->
+ * budget never exhausts -> degrades to the un-limited behaviour, never worse. zr_persist_magic
+ * validates the region on cold boot (see start_work_handler). */
+#define ZR_PERSIST_MAGIC 0x5A524231U /* 'ZRB1' */
+static __noinit uint32_t zr_persist_magic;
+static __noinit uint32_t zr_reboot_count;
+static uint32_t last_disc_ms;  /* k_uptime at the last disconnect (episode-freshness gate) */
+static uint32_t zr_rx_at_arm;  /* rx_notif snapshot when the check was armed */
+static uint32_t zr_attempts;   /* bounces used in the current episode (survives the bounce reconnect) */
+static bool zr_recovering;     /* true between a bounce and its reconnect -> re-arm the check */
+static uint32_t zr_bounces;    /* total auto-recover bounces (heartbeat diag) */
+static bool zr_healthy_since_boot; /* link streamed healthily at least once this boot (reboot guard) */
+static bool zr_delay_rescan;       /* set before a zombie disconnect -> disconnected() may delay re-scan */
+
+static void zombie_check_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	struct bt_conn *c = default_conn; /* snapshot on the system wq */
+
+	if (!c) {
+		return; /* link dropped before the check -> nothing to recover */
+	}
+	/* #8 review: hold a ref across the handler. default_conn is unref'd on the BT RX wq in
+	 * disconnected(); on today's cooperative single-core build the BT RX wq can't interleave
+	 * into this non-yielding region, but the ref makes "c survives bt_conn_disconnect() below"
+	 * true by construction rather than by scheduling accident (robust if either changes). */
+	bt_conn_ref(c);
+
+	uint32_t delta = rx_notif - zr_rx_at_arm;
+	struct zr_ctx ctx = {
+		.rx_delta = delta,
+		.rx_min = ZR_MIN_RX,
+		.bounce_attempts = zr_attempts,
+		.bounce_max = ZR_BOUNCE_MAX,
+		.uptime_ms = k_uptime_get_32(),
+		.reboot_min_uptime_ms = ZR_REBOOT_MIN_UPTIME_MS,
+		.reboot_count = zr_reboot_count,
+		.reboot_budget = ZR_REBOOT_BUDGET,
+		.healthy_since_boot = zr_healthy_since_boot,
+	};
+
+	switch (zr_decide(&ctx)) {
+	case ZR_OK_RESET:
+		zr_healthy_since_boot = true;
+		zr_recovering = false;
+		zr_attempts = 0;
+		LOG_INF("zombie-check OK: rx+%u in %us (flowing)", delta, ZR_WINDOW_MS / 1000U);
+		break;
+	case ZR_DELAYED_BOUNCE:
+		zr_attempts++;
+		zr_bounces++;
+		zr_recovering = true;
+		zr_delay_rescan = true; /* disconnected() handles the (immediate-or-delayed) re-scan */
+		LOG_WRN("ZOMBIE: rx+%u<%u in %us (conn=1 sub=%u) -> bounce %u/%u",
+			delta, ZR_MIN_RX, ZR_WINDOW_MS / 1000U, (unsigned)sub_count,
+			zr_attempts, ZR_BOUNCE_MAX);
+		if (bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN)) {
+			/* conn already gone -> no disconnected() will consume the state; end the
+			 * episode cleanly so a fresh natural reconnect starts at the bottom rung. */
+			LOG_WRN("ZOMBIE bounce: conn already gone");
+			zr_recovering = false;
+			zr_attempts = 0;
+			zr_delay_rescan = false;
+		}
+		break;
+	case ZR_REBOOT:
+		zr_reboot_count++; /* retained across the warm reboot -> rate-limits re-enumerations */
+		LOG_WRN("ZOMBIE persists after %u bounces (up=%us) -> self-reboot now (reboots=%u/%u)",
+			zr_attempts, k_uptime_get_32() / 1000U, zr_reboot_count, ZR_REBOOT_BUDGET);
+		/* This handler runs on the system workqueue, so this 50 ms sleep briefly
+		 * stalls other delayable work -- intentional: sys_reboot() below is the
+		 * last thing this queue ever does. The sleep lets the log line flush over
+		 * USB-CDC before the reset. */
+		bt_conn_unref(c); /* balance the ref before the point of no return */
+		k_msleep(50);
+		sys_reboot(SYS_REBOOT_WARM);
+		return;                /* unreachable; unref already done, do not fall through */
+	case ZR_GIVE_UP:
+	default:
+		LOG_WRN("ZOMBIE persists after %u bounces -> giving up until next wake "
+			"(healthy_since_boot=%d up=%us reboots=%u/%u)",
+			zr_attempts, zr_healthy_since_boot ? 1 : 0, k_uptime_get_32() / 1000U,
+			zr_reboot_count, ZR_REBOOT_BUDGET);
+		zr_recovering = false;
+		zr_attempts = 0;
+		break;
+	}
+	bt_conn_unref(c);
+}
+static K_WORK_DELAYABLE_DEFINE(zombie_check_work, zombie_check_handler);
+
+/* #8 v3.5/v3.6 latency-R&D instrumentation (LOGGING-ONLY — no behaviour change; zr_decide()
+ * and the recovery ladder are untouched). A post-reconnect zombie is cured only by the bounce.
+ * Most zombies are SILENT (rx stays at 0), but some emit a one-shot flush burst (field max 97)
+ * then stall — so the discriminator is the ZR_MIN_RX(=100) burst-ceiling, NOT zero. v3.5's
+ * checkpoints {500,1000,1500} ms showed a healthy reconnect clears 100 by ~1 s (~134) while
+ * silent/burst-stall zombies (<=97) do not, which JUSTIFIED v3.6 shortening ZR_WINDOW_MS to
+ * 1000 ms (threshold kept at 100). We KEEP the probe under the 1 s window — now at
+ * {250,500,750} ms — to (a) keep validating that the 1 s decision agrees with what 2 s would
+ * have said, especially that no healthy reconnect lands just under 100 at 1 s, and (b)
+ * characterise whether an even shorter window is ever safe. The probe logs the rx delta WITHOUT
+ * touching the decision (still taken at ZR_WINDOW_MS by zombie_check_work). A few cheap INF
+ * lines per episode on the system workqueue (NOT the GATT notify path) -> no BLE-timing impact.
+ * Armed/cancelled in lockstep with zombie_check_work. */
+static const uint16_t zr_probe_ms[] = { 250U, 500U, 750U }; /* strictly < ZR_WINDOW_MS, ascending */
+static uint8_t zr_probe_idx; /* next checkpoint index to log; reset to 0 when armed */
+
+static void zr_probe_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(zr_probe_work, zr_probe_handler);
+static void zr_probe_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (!default_conn) {
+		return; /* link dropped -> disconnected() cancels this work; episode is over */
+	}
+	uint8_t i = zr_probe_idx;
+	if (i >= ARRAY_SIZE(zr_probe_ms)) {
+		return; /* all checkpoints logged; zombie_check_work decides at ZR_WINDOW_MS */
+	}
+	/* rx_notif is monotonic and zr_rx_at_arm was snapshotted by this same arm, so the
+	 * delta is exactly this window's accumulation regardless of a racing increment. */
+	uint32_t delta = rx_notif - zr_rx_at_arm;
+	LOG_INF("zombie-probe @%ums: rx+%u (thr=%u @ %ums)",
+		(unsigned)zr_probe_ms[i], delta, ZR_MIN_RX, ZR_WINDOW_MS);
+	zr_probe_idx = i + 1;
+	if (zr_probe_idx < ARRAY_SIZE(zr_probe_ms)) {
+		k_work_reschedule(&zr_probe_work,
+				  K_MSEC(zr_probe_ms[zr_probe_idx] - zr_probe_ms[i]));
+	}
+}
+
 static void report_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -171,6 +364,7 @@ static void report_work_handler(struct k_work *work)
 				evt.value_handle, report.dx, report.dy, report.wheel,
 				report.hwheel, (unsigned)report.buttons);
 			ble_hid_host_publish(host_dev, &report);
+			pub_reports++; /* #8 diag: reports actually forwarded to USB */
 		}
 	}
 }
@@ -184,6 +378,8 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 		params->value_handle = 0U; /* subscription torn down */
 		return BT_GATT_ITER_STOP;
 	}
+
+	rx_notif++; /* #8 diag: a real GATT notification arrived from the mouse */
 
 	struct hid_subscription *sub = CONTAINER_OF(params, struct hid_subscription, params);
 	struct report_evt evt;
@@ -447,13 +643,43 @@ static void subscribe_pending(struct bt_conn *conn)
 		struct bt_conn_info info;
 		disc_state = DISC_IDLE;
 		LOG_INF("discovery done: subscribed to %u report(s)", sub_count);
-		/* OBSERVE-only: log the EFFECTIVE link params even if the peer never
-		 * sent a param-update (then le_param_updated never fires). interval unit
-		 * 1.25 ms, timeout unit 10 ms. */
+		/* OBSERVE: log the EFFECTIVE link params even if the peer never sent a
+		 * param-update. interval unit 1.25 ms, timeout unit 10 ms. */
 		if (bt_conn_get_info(conn, &info) == 0 && info.type == BT_CONN_TYPE_LE) {
+			cur_latency = info.le.latency; /* #8 diag: surface the peer's latency in heartbeat */
 			LOG_INF("effective params @disc-done: interval %u.%02u ms, latency %u, timeout %u ms",
 				(info.le.interval * 5U) / 4U, ((info.le.interval * 5U) % 4U) * 25U,
 				info.le.latency, info.le.timeout * 10U);
+		}
+		/* #8 v2: the active latency-0 re-drive (Fix-A) was REMOVED here. lat=0 never
+		 * fixed the zombie (proven: it zombied at lat=0) and forcing latency 0 makes the
+		 * mouse wake on every connection interval (worse battery); auto-recover heals the
+		 * zombie regardless. The peer now keeps its requested latency (~44) -> it can skip
+		 * idle connection events and sleep -> better mouse battery. */
+		/* #8 auto-recover: arm the zombie-check on EVERY reconnect (zombie is probabilistic,
+		 * not duration-gated). A non-recovering reconnect = a fresh episode (attempts reset);
+		 * a bounce's reconnect (zr_recovering) keeps the attempt count. Storm-safe via the
+		 * reschedule (only the post-storm check fires). */
+		{
+			uint32_t gap = k_uptime_get_32() - last_disc_ms;
+
+			/* #8 review: only a bounce's OWN reconnect (which lands within ~the bounce
+			 * delay) continues the episode and keeps the attempt count. A slow reconnect
+			 * means the bounced peer deep-slept then woke much later (or a connect/
+			 * security failure intervened) -> treat as a FRESH episode so a stranded
+			 * zr_recovering can't carry a stale count into it and skip rungs to a reboot. */
+			if (!zr_recovering || gap > (ZR_BOUNCE_DELAY_MS + ZR_WINDOW_MS + 3000U)) {
+				zr_attempts = 0;
+				zr_recovering = false;
+			}
+			zr_rx_at_arm = rx_notif;
+			k_work_reschedule(&zombie_check_work, K_MSEC(ZR_WINDOW_MS));
+			/* #8 v3.5: log sub-window rx at zr_probe_ms[] (LOGGING-ONLY; the decision
+			 * still happens at ZR_WINDOW_MS above). Same arm snapshot (zr_rx_at_arm). */
+			zr_probe_idx = 0;
+			k_work_reschedule(&zr_probe_work, K_MSEC(zr_probe_ms[0]));
+			LOG_INF("zombie-check armed: gap=%us recovering=%d att=%u rx0=%u",
+				gap / 1000U, zr_recovering ? 1 : 0, zr_attempts, rx_notif);
 		}
 		return;
 	}
@@ -616,6 +842,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	if (default_conn) {
 		return;
 	}
+
 	/* Only initiate to connectable advertising (skip scan responses). */
 	if (type != BT_GAP_ADV_TYPE_ADV_IND && type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
 	    type != BT_GAP_ADV_TYPE_EXT_ADV) {
@@ -686,14 +913,33 @@ static void scan_retry_handler(struct k_work *work)
 }
 static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_handler);
 
+static void zr_rescan_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (!default_conn) {
+		start_scan();
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(zr_rescan_work, zr_rescan_handler);
+
 static void heartbeat_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat_handler);
 static void heartbeat_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u",
+	/* #8 freeze fix: a sustained healthy session refills the self-reboot budget, so an
+	 * isolated zombie hours later can still reboot once while a tight bad streak cannot. */
+	if (zr_healthy_since_boot && k_uptime_get_32() >= ZR_REBOOT_STREAK_RESET_MS) {
+		zr_reboot_count = 0;
+	}
+	/* rec/att/reboots surface a recovery-in-progress so the 5 s post-bounce window and a
+	 * recovering link aren't mis-read as idle-death by the observation protocol. */
+	LOG_INF("HB up=%us conn=%d sub=%u disc=%d scan_ok=%u scan_fail=%u rx_notif=%u pub=%u "
+		"lat=%u zr=%u rec=%d att=%u reboots=%u",
 		k_uptime_get_32() / 1000U, default_conn ? 1 : 0,
-		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails);
+		(unsigned)sub_count, (int)disc_state, scan_starts, scan_fails,
+		rx_notif, pub_reports, cur_latency, zr_bounces,
+		zr_recovering ? 1 : 0, zr_attempts, zr_reboot_count);
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60));
 }
 
@@ -777,7 +1023,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	char s[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), s, sizeof(s));
-	LOG_INF("disconnected: %s (reason 0x%02x)", s, reason);
+	LOG_INF("disconnected: %s (reason 0x%02x) rx_notif=%u pub=%u", s, reason, rx_notif,
+		pub_reports);
 
 	if (default_conn != conn) {
 		return;
@@ -788,6 +1035,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	pending_count = 0;
 	pending_idx = 0;
 	disc_state = DISC_IDLE;
+	cur_latency = 0xFFFF; /* #8 diag: latency n/a while disconnected */
+	last_disc_ms = k_uptime_get_32(); /* #8 auto-recover: deep-sleep gate timestamp */
 	/* Invalidate the peer's layout the instant the link drops: reports still
 	 * queued (or arriving before the next peer's report map is parsed) must NOT
 	 * be decoded against a stale layout -- critical when reconnecting to a
@@ -804,18 +1053,49 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		ble_hid_host_reset(host_dev);
 	}
 
-	start_scan(); /* auto-reconnect: re-scan, match the bonded peer, re-discover */
+	/* #8 review: a pending zombie-check belongs to the connection that just dropped.
+	 * Cancel it so it cannot fire against the NEXT connection mid-discovery and bounce a
+	 * healthy reconnect (observed in ~/zmk-logs). The new link re-arms at discovery-done. */
+	k_work_cancel_delayable(&zombie_check_work);
+	k_work_cancel_delayable(&zr_probe_work); /* #8 v3.5: its checkpoints belong to this link too */
+
+	/* Read-and-clear: a stranded flag (our bounce racing a natural disconnect) must not
+	 * wrongly delay a later innocent re-scan. */
+	bool bounce = zr_delay_rescan;
+
+	zr_delay_rescan = false;
+
+	if (bounce) {
+		/* #8 freeze fix: the FIRST bounce re-scans IMMEDIATELY (most zombies clear on one
+		 * bounce; the 5 s deaf window was pure added freeze). Only the 2nd+ bounce delays,
+		 * to give a stubborn peer time to fully reset before we retry. */
+		if (zr_attempts >= 2) {
+			k_work_reschedule(&zr_rescan_work, K_MSEC(ZR_BOUNCE_DELAY_MS));
+		} else {
+			start_scan();
+		}
+	} else {
+		/* Any non-bounce disconnect ends the recovery episode: start fresh so a stranded
+		 * zr_recovering can't carry a stale attempt count into the next reconnect. */
+		zr_recovering = false;
+		zr_attempts = 0;
+		start_scan();
+	}
 }
 
-/* OBSERVE-only: log the FINAL negotiated link params (no behavior change). The
- * mouse (peripheral) may send an L2CAP conn-param-update-request after connect;
- * with no le_param_req registered Zephyr auto-accepts it, so the real
- * supervision timeout is otherwise invisible. Fires once per (re)negotiation --
+/* #8 v2: le_param_req (the Fix-A latency-0 clamp) was REMOVED. With no le_param_req
+ * callback registered the host accepts the peer's requested params by default, so the
+ * IST PRO keeps its preferred latency (~44) -> it can skip idle connection events and
+ * sleep -> better mouse battery. lat=0 was proven NOT to fix the zombie; auto-recover
+ * (the bt_conn_disconnect bounce) is what actually heals it. */
+
+/* OBSERVE: log the FINAL negotiated link params. Fires once per (re)negotiation,
  * NOT per-PDU. interval unit = 1.25 ms, timeout unit = 10 ms. */
 static void le_param_updated(struct bt_conn *conn, uint16_t interval,
 			     uint16_t latency, uint16_t timeout)
 {
 	ARG_UNUSED(conn);
+	cur_latency = latency; /* #8 diag: track effective latency for the heartbeat */
 	LOG_INF("conn params updated: interval %u.%02u ms, latency %u, timeout %u ms",
 		(interval * 5U) / 4U, ((interval * 5U) % 4U) * 25U, latency, timeout * 10U);
 }
@@ -889,6 +1169,17 @@ static void start_work_handler(struct k_work *work)
 	LOG_INF("ble-hid-host central up on %s (filter: %s)",
 		host_dev ? host_dev->name : "?",
 		name_filter ? name_filter : "<any HOGP pointer>");
+	/* #8: validate the retained reboot-budget region. Cold boot -> RAM is garbage (magic
+	 * mismatch) -> init to 0; warm self-reboot -> magic+count retained -> budget spans it. */
+	if (zr_persist_magic != ZR_PERSIST_MAGIC) {
+		zr_persist_magic = ZR_PERSIST_MAGIC;
+		zr_reboot_count = 0;
+	}
+	LOG_INF("ble_hid_host up (v3.6 fast-detect: window=%ums thr=%u (burst-ceiling count), 1st-bounce-immediate, "
+		"bounce_max=%u delay=%ums reboot_gate=%us budget=%u/%u)",
+		ZR_WINDOW_MS, ZR_MIN_RX,
+		ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U,
+		zr_reboot_count, ZR_REBOOT_BUDGET);
 	start_scan();
 	k_work_reschedule(&heartbeat_work, K_SECONDS(60)); /* #8: arm idle heartbeat */
 }

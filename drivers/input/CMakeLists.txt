@@ -14,3 +14,4 @@ zephyr_library_sources_ifdef(CONFIG_ZMK_BLE_HID_HOST hid_report_decode.c)
 # CONFIG_BT_CENTRAL is set (the shield .conf enables it); otherwise the file
 # provides a no-op start() stub so an INPUT-only build still links.
 zephyr_library_sources_ifdef(CONFIG_ZMK_BLE_HID_HOST hog_central.c)
+zephyr_library_sources_ifdef(CONFIG_ZMK_BLE_HID_HOST zr_policy.c)
