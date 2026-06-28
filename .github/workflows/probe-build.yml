@@ -32,7 +32,7 @@ jobs:
         run: west build -b xiao_ble .      # source dir = . (cwd is the probe app root)
 
       - name: Upload UF2
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-uf2
           path: probe/build/zephyr/zephyr.uf2
