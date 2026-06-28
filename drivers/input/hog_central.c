@@ -126,6 +126,10 @@ static void start_scan(void);
 static void subscribe_pending(struct bt_conn *conn);
 static void discover_ccc(struct bt_conn *conn);
 static void start_report_discovery(struct bt_conn *conn);
+/* #8 v3.7: arm/re-arm the zombie-check window + its sub-window probe against the current
+ * rx_notif. Defined after the work items it schedules; forward-declared here so the WAIT
+ * re-observe (inside zombie_check_handler, which precedes those work items) can call it. */
+static void zr_arm_window(void);
 
 /* ─────────────── notify -> defer -> decode (k_msgq + k_work) ─────────────── */
 struct report_evt {
@@ -157,11 +161,16 @@ static uint16_t cur_latency = 0xFFFF;
  * Reconnect storms are safe: each reconnect k_work_reschedule()s the single check, so only
  * the post-storm check fires (no bounce spam).
  *
- * v3 escalation ladder (zr_decide()):
+ * escalation ladder (zr_decide(), top precedence first):
  *   1. ZR_OK: healthy (rx_delta >= ZR_MIN_RX) -> mark healthy_since_boot, reset state.
+ *   1b. ZR_WAIT (v3.7 patience): on a LONG-IDLE episode that came up <100, re-observe the same
+ *      window (no disconnect/bounce/reboot) up to ZR_PATIENCE_MAX rounds -> let a just-woken
+ *      mouse self-stream past the (unchanged) 100 ceiling. Inert on short-gap reconnects and
+ *      once the budget is spent -> falls through to the v3.6 ladder below.
  *   2. ZR_DELAYED_BOUNCE: zombie detected, bounces < ZR_BOUNCE_MAX -> bt_conn_disconnect.
- *      The 1st bounce re-scans IMMEDIATELY (most zombies clear on one bounce); the 2nd+
- *      bounce delays the re-scan by ZR_BOUNCE_DELAY_MS so a stubborn peer fully resets.
+ *      The 1st bounce re-scans IMMEDIATELY on short-gap episodes (most zombies clear on one
+ *      bounce); long-idle episodes (and the 2nd+ bounce) delay the re-scan by ZR_BOUNCE_DELAY_MS
+ *      so a stubborn / deep-slept peer fully resets (the field-proven curative down-gap).
  *   3. ZR_REBOOT: zombie persists after ZR_BOUNCE_MAX bounces AND the link was healthy at
  *      least once this boot AND uptime >= ZR_REBOOT_MIN_UPTIME_MS AND the reboot budget is
  *      not spent -> sys_reboot(SYS_REBOOT_WARM) last resort (bond in NVS; auto-reconnects).
@@ -190,6 +199,15 @@ static uint16_t cur_latency = 0xFFFF;
 #define ZR_BOUNCE_MAX            2U      /* bounces before escalating to reboot */
 #define ZR_BOUNCE_DELAY_MS       5000U   /* re-scan delay AFTER the 2nd+ bounce (peer reset); the 1st
 					 * bounce re-scans immediately -- see disconnected() */
+/* #8 v3.7 patience (long-idle): on a long-idle reconnect that comes up <100 (silent or a
+ * stalling wake-burst), re-observe the SAME window up to ZR_PATIENCE_MAX rounds instead of an
+ * immediate (field-proven-useless) bounce -- letting a just-woken mouse self-stream past the
+ * UNCHANGED 100 ceiling, near the direct-BT baseline. Short-gap reconnects (gap <
+ * ZR_LONGIDLE_GAP_MS, e.g. our own fast bounces) are NOT patient -> exact v3.6. Bounded by the
+ * per-episode budget (re-granted once per long-idle bounce, but zr_attempts caps the bounces),
+ * so the ladder ALWAYS eventually escalates. */
+#define ZR_PATIENCE_MAX          3U      /* re-observe windows (ZR_WINDOW_MS each) before escalating */
+#define ZR_LONGIDLE_GAP_MS       60000U  /* gap >= this => long-idle => patience-eligible (deep-sleep wake) */
 #define ZR_REBOOT_MIN_UPTIME_MS  60000U  /* don't self-reboot within this uptime (post-boot loop guard) */
 #define ZR_REBOOT_BUDGET         2U      /* max self-reboots (USB re-enumerations) per bad streak before
 					 * GIVE_UP -- a chronic peer degrades to manual recovery, not a
@@ -211,6 +229,11 @@ static bool zr_recovering;     /* true between a bounce and its reconnect -> re-
 static uint32_t zr_bounces;    /* total auto-recover bounces (heartbeat diag) */
 static bool zr_healthy_since_boot; /* link streamed healthily at least once this boot (reboot guard) */
 static bool zr_delay_rescan;       /* set before a zombie disconnect -> disconnected() may delay re-scan */
+static uint32_t zr_patience_left;  /* #8 v3.7: re-observe rounds left this episode (survives the WAIT
+				    * re-arm, like zr_attempts). NOT __noinit: a fresh boot starts patience
+				    * OFF until the first long-idle episode latches it. 0 == off == v3.6. */
+static bool zr_patience_eligible;  /* #8 v3.7: latched per-episode long-idle flag (gap >= ZR_LONGIDLE_GAP_MS);
+				    * recomputed on every FRESH arm so a stale true can never leak in. */
 
 static void zombie_check_handler(struct k_work *work)
 {
@@ -237,15 +260,28 @@ static void zombie_check_handler(struct k_work *work)
 		.reboot_count = zr_reboot_count,
 		.reboot_budget = ZR_REBOOT_BUDGET,
 		.healthy_since_boot = zr_healthy_since_boot,
+		.patience_eligible = zr_patience_eligible,
+		.patience_left = zr_patience_left,
 	};
 
 	switch (zr_decide(&ctx)) {
-	case ZR_OK_RESET:
+	case ZR_OK_RESET: {
+		/* #8 v3.7 soak metric: how this episode was cured. waited = patience rounds spent in
+		 * the CURRENT (re-granted) budget; cured-by=patience means the mouse self-streamed with
+		 * zero bounce/reboot (the DoD win). Computed BEFORE the patience state is cleared. */
+		uint32_t waited = zr_patience_eligible ? (ZR_PATIENCE_MAX - zr_patience_left) : 0U;
+		const char *cured_by = (zr_attempts > 0)      ? "bounce"
+				       : (waited > 0)         ? "patience"
+							      : "first-window";
 		zr_healthy_since_boot = true;
 		zr_recovering = false;
 		zr_attempts = 0;
-		LOG_INF("zombie-check OK: rx+%u in %us (flowing)", delta, ZR_WINDOW_MS / 1000U);
+		zr_patience_left = 0;
+		zr_patience_eligible = false;
+		LOG_INF("zombie-check OK: rx+%u in %us (flowing) cured-by=%s waited=%u",
+			delta, ZR_WINDOW_MS / 1000U, cured_by, waited);
 		break;
+	}
 	case ZR_DELAYED_BOUNCE:
 		zr_attempts++;
 		zr_bounces++;
@@ -261,7 +297,22 @@ static void zombie_check_handler(struct k_work *work)
 			zr_recovering = false;
 			zr_attempts = 0;
 			zr_delay_rescan = false;
+			zr_patience_left = 0;       /* #8 v3.7: end episode cleanly, no stale patience */
+			zr_patience_eligible = false;
 		}
+		break;
+	case ZR_WAIT:
+		/* #8 v3.7 patience: long-idle, still <100, rounds left -> re-observe the SAME window.
+		 * NO disconnect/bounce/reboot, and (crucially) we do NOT set zr_healthy_since_boot, so
+		 * patience can never fabricate a false healthy that corrupts the reboot guard. */
+		zr_patience_left--;            /* consume one round (monotone -> bounded -> always escalates) */
+		zr_recovering = true;          /* episode in progress across the in-place re-arm */
+		/* re-snapshot + re-arm: each window measures a FRESH 1s of flow, so a slow trickle can
+		 * never accumulate across rounds into a false healthy (the per-window COUNT semantics the
+		 * 100 ceiling needs). zr_arm_window() sets zr_rx_at_arm = rx_notif and re-arms the probe. */
+		zr_arm_window();
+		LOG_INF("ZOMBIE-WAIT(long-idle): rx+%u<%u in %us (conn=1 sub=%u) -> patience %u left, re-observe",
+			delta, ZR_MIN_RX, ZR_WINDOW_MS / 1000U, (unsigned)sub_count, zr_patience_left);
 		break;
 	case ZR_REBOOT:
 		zr_reboot_count++; /* retained across the warm reboot -> rate-limits re-enumerations */
@@ -283,6 +334,8 @@ static void zombie_check_handler(struct k_work *work)
 			zr_reboot_count, ZR_REBOOT_BUDGET);
 		zr_recovering = false;
 		zr_attempts = 0;
+		zr_patience_left = 0;          /* #8 v3.7: episode over -> no stale patience into next wake */
+		zr_patience_eligible = false;
 		break;
 	}
 	bt_conn_unref(c);
@@ -327,6 +380,17 @@ static void zr_probe_handler(struct k_work *work)
 		k_work_reschedule(&zr_probe_work,
 				  K_MSEC(zr_probe_ms[zr_probe_idx] - zr_probe_ms[i]));
 	}
+}
+
+/* #8 v3.7: snapshot rx_notif and (re)arm the ZR_WINDOW_MS decision plus the logging-only
+ * sub-window probe. Shared by the per-reconnect arm (subscribe_pending) and the WAIT re-observe
+ * (zombie_check_handler) so both measure a FRESH window from the same snapshot. */
+static void zr_arm_window(void)
+{
+	zr_rx_at_arm = rx_notif;
+	k_work_reschedule(&zombie_check_work, K_MSEC(ZR_WINDOW_MS));
+	zr_probe_idx = 0;
+	k_work_reschedule(&zr_probe_work, K_MSEC(zr_probe_ms[0]));
 }
 
 static void report_work_handler(struct k_work *work)
@@ -671,15 +735,25 @@ static void subscribe_pending(struct bt_conn *conn)
 			if (!zr_recovering || gap > (ZR_BOUNCE_DELAY_MS + ZR_WINDOW_MS + 3000U)) {
 				zr_attempts = 0;
 				zr_recovering = false;
+				/* #8 v3.7: a FRESH episode -> (re)latch patience eligibility from the idle
+				 * gap and seed the re-observe budget. Recomputed on EVERY fresh arm so a
+				 * stale `eligible` can never leak from a prior episode. */
+				zr_patience_eligible = (gap >= ZR_LONGIDLE_GAP_MS);
+				zr_patience_left = zr_patience_eligible ? ZR_PATIENCE_MAX : 0;
+			} else if (zr_patience_eligible) {
+				/* #8 v3.7: a long-idle bounce's OWN reconnect -- the post-down-gap
+				 * CONTINUATION window where the field cure actually landed (23:31:23,
+				 * gap=5s, att=2). Refresh the budget so the now-woken mouse gets a fresh
+				 * re-observe window. Bounded: zr_attempts is capped at ZR_BOUNCE_MAX, so the
+				 * re-grants per episode are bounded and the ladder still terminates. */
+				zr_patience_left = ZR_PATIENCE_MAX;
 			}
-			zr_rx_at_arm = rx_notif;
-			k_work_reschedule(&zombie_check_work, K_MSEC(ZR_WINDOW_MS));
-			/* #8 v3.5: log sub-window rx at zr_probe_ms[] (LOGGING-ONLY; the decision
-			 * still happens at ZR_WINDOW_MS above). Same arm snapshot (zr_rx_at_arm). */
-			zr_probe_idx = 0;
-			k_work_reschedule(&zr_probe_work, K_MSEC(zr_probe_ms[0]));
-			LOG_INF("zombie-check armed: gap=%us recovering=%d att=%u rx0=%u",
-				gap / 1000U, zr_recovering ? 1 : 0, zr_attempts, rx_notif);
+			/* #8 v3.5: zr_arm_window() also arms the LOGGING-ONLY sub-window probe at
+			 * zr_probe_ms[] (the decision still happens at ZR_WINDOW_MS; same snapshot). */
+			zr_arm_window();
+			LOG_INF("zombie-check armed: gap=%us recovering=%d att=%u rx0=%u pat=%u/%u elig=%d",
+				gap / 1000U, zr_recovering ? 1 : 0, zr_attempts, rx_notif,
+				zr_patience_left, ZR_PATIENCE_MAX, zr_patience_eligible ? 1 : 0);
 		}
 		return;
 	}
@@ -1066,10 +1140,12 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	zr_delay_rescan = false;
 
 	if (bounce) {
-		/* #8 freeze fix: the FIRST bounce re-scans IMMEDIATELY (most zombies clear on one
-		 * bounce; the 5 s deaf window was pure added freeze). Only the 2nd+ bounce delays,
-		 * to give a stubborn peer time to fully reset before we retry. */
-		if (zr_attempts >= 2) {
+		/* #8 freeze fix: on a SHORT-GAP episode the FIRST bounce re-scans IMMEDIATELY (most
+		 * such zombies clear on one bounce; the 5 s deaf window was pure added freeze). The
+		 * 2nd+ bounce delays. #8 v3.7: a LONG-IDLE episode (zr_patience_eligible) routes even
+		 * its first post-patience bounce through the ZR_BOUNCE_DELAY_MS down-gap -- fast
+		 * bounces deliver rx+0 on a deep-slept peer; only a real down-gap (peer reset) cures. */
+		if (zr_attempts >= 2 || zr_patience_eligible) {
 			k_work_reschedule(&zr_rescan_work, K_MSEC(ZR_BOUNCE_DELAY_MS));
 		} else {
 			start_scan();
@@ -1079,6 +1155,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		 * zr_recovering can't carry a stale attempt count into the next reconnect. */
 		zr_recovering = false;
 		zr_attempts = 0;
+		zr_patience_left = 0;       /* #8 v3.7: clear patience too -> next reconnect re-latches */
+		zr_patience_eligible = false;
 		start_scan();
 	}
 }
@@ -1175,9 +1253,10 @@ static void start_work_handler(struct k_work *work)
 		zr_persist_magic = ZR_PERSIST_MAGIC;
 		zr_reboot_count = 0;
 	}
-	LOG_INF("ble_hid_host up (v3.6 fast-detect: window=%ums thr=%u (burst-ceiling count), 1st-bounce-immediate, "
+	LOG_INF("ble_hid_host up (v3.7 patience: window=%ums thr=%u (burst-ceiling count), "
+		"patience=%ux@long-idle>=%us, short-gap=1st-bounce-immediate/long-idle=down-gap, "
 		"bounce_max=%u delay=%ums reboot_gate=%us budget=%u/%u)",
-		ZR_WINDOW_MS, ZR_MIN_RX,
+		ZR_WINDOW_MS, ZR_MIN_RX, ZR_PATIENCE_MAX, ZR_LONGIDLE_GAP_MS / 1000U,
 		ZR_BOUNCE_MAX, ZR_BOUNCE_DELAY_MS, ZR_REBOOT_MIN_UPTIME_MS / 1000U,
 		zr_reboot_count, ZR_REBOOT_BUDGET);
 	start_scan();

@@ -17,6 +17,12 @@ enum zr_action {
     ZR_DELAYED_BOUNCE, /* disconnect, then re-scan after a delay (let the peer reset) */
     ZR_REBOOT,         /* self-reboot the dongle (== the known re-plug cure) */
     ZR_GIVE_UP,        /* stop; wait for the next natural wake (no reboot loop) */
+    /* v3.7 patience: not flowing yet, but spend a patience round on a long-idle episode:
+     * re-arm the SAME window -- do NOT disconnect/bounce/reboot, and do NOT set
+     * healthy_since_boot. Bounded by the caller's patience_left; falls through to the v3.6
+     * ladder when exhausted. APPENDED LAST so the four legacy enumerators keep their integer
+     * values (precedence in the ladder comes from rung ORDER, not from this enum value). */
+    ZR_WAIT,
 };
 
 struct zr_ctx {
@@ -29,6 +35,11 @@ struct zr_ctx {
     uint32_t reboot_count;         /* self-reboots already spent this streak (retained across reboots) */
     uint32_t reboot_budget;        /* ZR_REBOOT_BUDGET: max reboots before GIVE_UP (rate-limit) */
     bool healthy_since_boot;       /* the link streamed healthily at least once this boot */
+    /* v3.7 patience (both default 0/false -> the ZR_WAIT rung is INERT == v3.6 byte-for-byte): */
+    bool patience_eligible;        /* this episode qualifies for patience (long-idle gap, latched
+                                    * by the caller). false => the WAIT rung is unreachable. */
+    uint32_t patience_left;        /* re-observe rounds STILL available this episode; caller
+                                    * decrements per ZR_WAIT (like bounce_attempts). 0 => exhausted. */
 };
 
 /* Decide the next recovery action. Pure: no side effects, no globals. */

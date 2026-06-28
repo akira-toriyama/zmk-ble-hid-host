@@ -11,6 +11,14 @@ enum zr_action zr_decide(const struct zr_ctx *c)
     if (c->rx_delta >= c->rx_min) {
         return ZR_OK_RESET; /* flowing */
     }
+    /* v3.7 patience: a long-idle episode with re-observe rounds left -> wait one more window
+     * instead of bouncing. No disconnect/bounce/reboot and this never sets healthy_since_boot,
+     * so it cannot fabricate a false healthy. Inert (falls through to the v3.6 ladder) when the
+     * episode is not patience_eligible OR the budget is spent -> byte-for-byte v3.6 with patience
+     * off. The caller decrements patience_left per ZR_WAIT, so it always eventually escalates. */
+    if (c->patience_eligible && c->patience_left > 0) {
+        return ZR_WAIT;
+    }
     if (c->bounce_attempts < c->bounce_max) {
         return ZR_DELAYED_BOUNCE; /* still have light retries */
     }
