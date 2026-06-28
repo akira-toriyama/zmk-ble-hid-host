@@ -10,6 +10,6 @@ jobs:
     name: parser/decoder host tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run host-side parser/decoder tests
         run: make -C tests/parser test
