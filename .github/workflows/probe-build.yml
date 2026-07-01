@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Zephyr project
         # Runs `west init -l probe` / `west config` / `west update` itself.
@@ -32,7 +32,7 @@ jobs:
         run: west build -b xiao_ble .      # source dir = . (cwd is the probe app root)
 
       - name: Upload UF2
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-uf2
           path: probe/build/zephyr/zephyr.uf2
